@@ -1,0 +1,6 @@
+{
+  "name": "Клёвый прогноз — FishCast AI",
+  "description": "PWA-навигатор и база знаний рыбака: водоёмы от рек до безымянных прудов, карты глубин, разведка акваторий, F-индекс клёва, справочник приманок, дневник уловов и маршруты от дома до лунки.",
+  "requestFramePermissions": ["geolocation", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
