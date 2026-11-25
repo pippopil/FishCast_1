@@ -1,5 +1,5 @@
 export type WaterBodyType = 'reservoir' | 'river' | 'lake' | 'pond' | 'quarry' | 'oxbow';
-export type DataSourceType = 'registry' | 'osm' | 'satellite' | 'user';
+export type DataSourceType = 'registry' | 'osm' | 'google_places' | 'satellite' | 'user';
 export type ModerationStatus = 'verified' | 'unverified';
 
 export interface LatLng {
@@ -101,6 +101,9 @@ export interface WaterBody {
   center: LatLng;
   polygon: [number, number][]; // [lng, lat][] closed ring
   polygon_rings?: [number, number][][]; // Optional [outer, ...holes] closed rings for reservoirs with islands
+  polygon_parts?: [number, number][][][]; // Optional GeoJSON MultiPolygon parts ([outer, ...holes][]) for multi-basin waters
+  river_lines?: [number, number][][]; // Optional exact river channel centerlines ([lng, lat][][]) so rivers highlight water, not land
+  geometry_quality?: 'exact' | 'centerline' | 'approximate'; // Distinguishes real OSM contours from point placeholders
   area_ha: number;
   source: DataSourceType;
   confidence: number; // 0..1
@@ -115,6 +118,8 @@ export interface WaterBody {
   fishing_access_note?: string;
   region: string;
   external_id?: string;
+  google_place_id?: string;
+  google_maps_uri?: string;
   ndwi_stability: 'year_round' | 'seasonal_low' | 'dries_summer';
   vegetation_index: 'low' | 'moderate' | 'algal_bloom';
   water_clarity: 'clear' | 'moderate' | 'murky';
@@ -436,3 +441,39 @@ export interface OfflineMapRegion {
   water_body_ids: string[];
   downloaded_at: string;
 }
+
+export interface GpxTrackPoint {
+  lat: number;
+  lng: number;
+  ele_m?: number | null;
+  time?: string | null;
+}
+
+export interface GpxWaypoint {
+  name: string;
+  lat: number;
+  lng: number;
+  ele_m?: number | null;
+  desc?: string | null;
+}
+
+export interface GpxRouteTrack {
+  id: string;
+  name: string;
+  file_name: string;
+  description?: string;
+  color: string;
+  visible: boolean;
+  segments: [number, number][][]; // [lng, lat][] per track segment
+  waypoints: GpxWaypoint[];
+  start_point: LatLng;
+  end_point: LatLng;
+  bbox: MapBbox;
+  distance_m: number;
+  duration_s: number | null;
+  elevation_gain_m: number | null;
+  point_count: number;
+  recorded_at: string | null;
+  imported_at: string;
+}
+

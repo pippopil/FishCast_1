@@ -6,6 +6,8 @@ import {
   Clock,
   Database,
   Download,
+  Eye,
+  EyeOff,
   HardDrive,
   Image as ImageIcon,
   LogOut,
@@ -13,9 +15,11 @@ import {
   Maximize2,
   NotebookPen,
   RefreshCw,
+  Route,
   Settings,
   Thermometer,
   Trash2,
+  Upload,
   UserCheck,
   WifiOff,
   X,
@@ -46,8 +50,15 @@ import {
   PRESET_MAP_REGIONS,
   buildOfflineBboxForRegion,
   estimateRegionTileCount,
+  type OfflineDownloadProgress,
 } from '../lib/offlineMapRegions';
 import { REGIONS_CATALOG } from '../lib/regions';
+import {
+  formatTrackDistance,
+  formatTrackDuration,
+  parseGpxRouteTrack,
+  validateGpxFileMeta,
+} from '../lib/gpxParser';
 import {
   formatPhotoSize,
   processAndValidateDiaryPhoto,
@@ -57,6 +68,7 @@ import { resolveReportPhotoUrl } from '../utils/samplePhotos';
 import type {
   CatchReport,
   FishSpecies,
+  GpxRouteTrack,
   MapBbox,
   OfflineMapRegion,
   ReportOutcome,
@@ -87,10 +99,15 @@ interface DiaryAndProfileProps {
     minZoom: number;
     maxZoom: number;
     signal: AbortSignal;
-    onProgress: (done: number, total: number) => void;
+    onProgress: (done: number, total: number, detail?: OfflineDownloadProgress) => void;
   }) => Promise<void>;
   onDeleteOfflineRegion: (region: OfflineMapRegion) => Promise<void>;
   onFocusOfflineRegion?: (region: OfflineMapRegion) => void;
+  gpxTracks: GpxRouteTrack[];
+  onImportGpxTrack: (track: GpxRouteTrack) => Promise<void> | void;
+  onToggleGpxTrackVisibility: (trackId: string) => void;
+  onDeleteGpxTrack: (trackId: string) => Promise<void> | void;
+  onFocusGpxTrack?: (track: GpxRouteTrack) => void;
   onCreateDiaryEntry: (payload: {
     fish_species_id: string;
     water_body_id: string | null;
@@ -130,6 +147,11 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
   onDownloadOfflineRegion,
   onDeleteOfflineRegion,
   onFocusOfflineRegion,
+  gpxTracks,
+  onImportGpxTrack,
+  onToggleGpxTrackVisibility,
+  onDeleteGpxTrack,
+  onFocusGpxTrack,
   onCreateDiaryEntry,
   onDeleteReport,
   onAuthLogin,
@@ -188,7 +210,23 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
   const [selectedOfflineOptId, setSelectedOfflineOptId] = useState<string>(defaultOfflineChoice);
   const [offlineDetailLevel, setOfflineDetailLevel] = useState<'overview' | 'detailed'>('detailed');
   const [offlineDownloading, setOfflineDownloading] = useState(false);
-  const [offlineProgress, setOfflineProgress] = useState<{ done: number; total: number } | null>(null);
+  const [offlineProgress, setOfflineProgress] = useState<{
+    regionName: string;
+    done: number;
+    total: number;
+    cached: number;
+    failed: number;
+    bytesDownloaded: number;
+    currentZoom: number;
+  } | null>(null);
+  const [lastOfflineDownload, setLastOfflineDownload] = useState<{
+    id: string;
+    name: string;
+    cached: number;
+    total: number;
+    failed: number;
+    bytesDownloaded: number;
+  } | null>(null);
   const [offlineError, setOfflineError] = useState<string | null>(null);
   const [confirmClearOffline, setConfirmClearOffline] = useState(false);
   const offlineAbortRef = useRef<AbortController | null>(null);
@@ -244,10 +282,22 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
       return;
     }
     setOfflineError(null);
+    setLastOfflineDownload(null);
     setConfirmClearOffline(false);
     setOfflineDownloading(true);
     const est = estimateRegionTileCount(target.bbox, target.minZoom, target.maxZoom, 220);
-    setOfflineProgress({ done: 0, total: est });
+    let latestSnapshot = {
+      done: 0,
+      total: est,
+      cached: 0,
+      failed: 0,
+      bytesDownloaded: 0,
+      currentZoom: target.minZoom,
+    };
+    setOfflineProgress({
+      regionName: target.name,
+      ...latestSnapshot,
+    });
     const controller = new AbortController();
     offlineAbortRef.current = controller;
     try {
@@ -258,7 +308,28 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
         minZoom: target.minZoom,
         maxZoom: target.maxZoom,
         signal: controller.signal,
-        onProgress: (done, total) => setOfflineProgress({ done, total }),
+        onProgress: (done, total, detail) => {
+          latestSnapshot = {
+            done,
+            total,
+            cached: detail?.cached ?? done,
+            failed: detail?.failed ?? 0,
+            bytesDownloaded: detail?.bytesDownloaded ?? 0,
+            currentZoom: detail?.currentZoom ?? target.minZoom,
+          };
+          setOfflineProgress({
+            regionName: target.name,
+            ...latestSnapshot,
+          });
+        },
+      });
+      setLastOfflineDownload({
+        id: target.id,
+        name: target.name,
+        cached: latestSnapshot.cached,
+        total: latestSnapshot.total,
+        failed: latestSnapshot.failed,
+        bytesDownloaded: latestSnapshot.bytesDownloaded,
       });
       await refreshStorageStats();
     } catch (err) {
@@ -328,9 +399,54 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
     [diaryReports, chartSpeciesFilter]
   );
 
+  // GPX routes («от дома до лунки») import state
+  const [gpxCustomName, setGpxCustomName] = useState('');
+  const [gpxImporting, setGpxImporting] = useState(false);
+  const [gpxError, setGpxError] = useState<string | null>(null);
+  const [gpxSuccessMsg, setGpxSuccessMsg] = useState<string | null>(null);
+
+  const handleGpxFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    setGpxError(null);
+    setGpxSuccessMsg(null);
+
+    const metaErr = validateGpxFileMeta(file.name, file.size);
+    if (metaErr) {
+      setGpxError(metaErr);
+      return;
+    }
+
+    setGpxImporting(true);
+    try {
+      const xmlText = await file.text();
+      const parsed = parseGpxRouteTrack(xmlText, {
+        fileName: file.name,
+        customName: gpxCustomName,
+        colorIndex: gpxTracks.length,
+      });
+      if (!parsed.ok) {
+        setGpxError(parsed.error);
+        return;
+      }
+      await onImportGpxTrack(parsed.track);
+      setGpxCustomName('');
+      setGpxSuccessMsg(
+        `Маршрут «${parsed.track.name}» (${formatTrackDistance(parsed.track.distance_m)}, ${parsed.track.point_count} точек) сохранён и добавлен слоем на карту.`
+      );
+      await refreshStorageStats();
+    } catch {
+      setGpxError('Не удалось прочитать GPX-файл. Проверьте целостность файла.');
+    } finally {
+      setGpxImporting(false);
+    }
+  };
+
   useEffect(() => {
     void refreshStorageStats();
-  }, [refreshStorageStats, waterBodies.length, offlineRegions.length, reports.length, speciesList.length]);
+  }, [refreshStorageStats, waterBodies.length, offlineRegions.length, reports.length, speciesList.length, gpxTracks.length]);
 
   const formatReferenceTimestamp = (iso: string | null | undefined): string => {
     if (!iso) return 'Ожидает первичного кэширования';
@@ -884,6 +1000,169 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
                   </div>
                 </div>
               </>
+            )}
+          </section>
+
+          {/* GPX Routes Import & Layer Management («от дома до лунки») */}
+          <section
+            data-testid="gpx-tracks-section"
+            className="rounded-2xl border border-slate-200 bg-white p-5 space-y-4 dark:border-slate-800 dark:bg-slate-900"
+          >
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <h2 className="inline-flex items-center gap-2 text-base font-bold text-slate-900 dark:text-slate-100">
+                  <Route className="h-4 w-4 text-violet-600 dark:text-violet-400" aria-hidden="true" />
+                  GPX-маршруты «от дома до лунки»
+                </h2>
+                <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                  Импортируйте треки из Garmin, OsmAnd, Locus Map или смартфона — маршруты сохраняются офлайн в IndexedDB и накладываются слоями на карту.
+                </p>
+              </div>
+              <span className="shrink-0 font-mono text-xs text-slate-500 tabular-nums dark:text-slate-400">
+                {gpxTracks.filter((t) => t.visible).length}/{gpxTracks.length} на карте
+              </span>
+            </div>
+
+            <div className="flex flex-col gap-2.5 sm:flex-row sm:items-end">
+              <div className="flex-1">
+                <label htmlFor="gpx-route-name" className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
+                  Название маршрута (необязательно)
+                </label>
+                <input
+                  id="gpx-route-name"
+                  type="text"
+                  placeholder="Например: Дом → Сейм, зимняя лунка №3"
+                  value={gpxCustomName}
+                  onChange={(e) => setGpxCustomName(e.target.value)}
+                  className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                />
+              </div>
+
+              <label className="inline-flex min-h-[40px] cursor-pointer items-center justify-center gap-2 rounded-xl bg-violet-700 px-4 py-2 text-xs font-semibold text-white hover:bg-violet-800 transition-colors whitespace-nowrap shrink-0">
+                <Upload className="h-4 w-4" aria-hidden="true" />
+                <span>{gpxImporting ? 'Разбор GPX...' : 'Импортировать GPX'}</span>
+                <input
+                  data-testid="gpx-file-input"
+                  type="file"
+                  accept=".gpx,application/gpx+xml,application/xml,text/xml"
+                  disabled={gpxImporting}
+                  onChange={(e) => void handleGpxFileUpload(e)}
+                  className="sr-only"
+                />
+              </label>
+            </div>
+
+            {gpxError && (
+              <div role="alert" className="rounded-xl bg-rose-50 px-3.5 py-2 text-xs font-medium text-rose-800 dark:bg-rose-950/60 dark:text-rose-200">
+                {gpxError}
+              </div>
+            )}
+
+            {gpxSuccessMsg && (
+              <div className="flex items-center gap-2 rounded-xl bg-teal-50 px-3.5 py-2 text-xs font-medium text-teal-800 dark:bg-teal-950/50 dark:text-teal-200">
+                <CheckCircle2 className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>{gpxSuccessMsg}</span>
+              </div>
+            )}
+
+            {gpxTracks.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-200 px-4 py-5 text-center text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400">
+                Нет сохранённых GPX-маршрутов. Загрузите файл <span className="font-mono">.gpx</span> с треком дороги, тропы по льду или точек лунок — он сразу появится как слой на карте.
+              </div>
+            ) : (
+              <ul className="divide-y divide-slate-100 rounded-xl border border-slate-200 dark:divide-slate-800 dark:border-slate-700">
+                {gpxTracks.map((track) => {
+                  const durationLabel = formatTrackDuration(track.duration_s);
+                  return (
+                    <li key={track.id} className="flex flex-col gap-2.5 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-start gap-2.5">
+                        <span
+                          className="mt-1 h-3 w-3 shrink-0 rounded-full ring-2 ring-white dark:ring-slate-900"
+                          style={{ backgroundColor: track.color }}
+                          aria-hidden="true"
+                        />
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-bold text-slate-900 dark:text-slate-100">
+                            {track.name}
+                          </div>
+                          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[11px] text-slate-500 tabular-nums dark:text-slate-400">
+                            <span>{formatTrackDistance(track.distance_m)}</span>
+                            {durationLabel && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span>{durationLabel}</span>
+                              </>
+                            )}
+                            {track.elevation_gain_m !== null && track.elevation_gain_m > 0 && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span>+{track.elevation_gain_m} м</span>
+                              </>
+                            )}
+                            <span aria-hidden="true">·</span>
+                            <span>{track.point_count} точ.</span>
+                            {track.waypoints.length > 0 && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span>{track.waypoints.length} лунок/меток</span>
+                              </>
+                            )}
+                          </div>
+                          <div className="mt-0.5 text-[11px] text-slate-400 tabular-nums">
+                            {track.file_name} · {track.visible ? 'Слой включён на карте' : 'Слой скрыт'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => onToggleGpxTrackVisibility(track.id)}
+                          aria-label={track.visible ? `Скрыть маршрут ${track.name} на карте` : `Показать маршрут ${track.name} на карте`}
+                          title={track.visible ? 'Скрыть слой на карте' : 'Показать слой на карте'}
+                          className={`inline-flex h-9 items-center gap-1 rounded-lg border px-2.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                            track.visible
+                              ? 'border-violet-200 bg-violet-50 text-violet-800 hover:bg-violet-100 dark:border-violet-800 dark:bg-violet-950/60 dark:text-violet-200'
+                              : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400'
+                          }`}
+                        >
+                          {track.visible ? (
+                            <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+                          ) : (
+                            <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
+                          )}
+                          <span>{track.visible ? 'Слой вкл.' : 'Скрыт'}</span>
+                        </button>
+
+                        {onFocusGpxTrack && (
+                          <button
+                            type="button"
+                            onClick={() => onFocusGpxTrack(track)}
+                            aria-label={`Открыть маршрут ${track.name} на карте`}
+                            title="Показать маршрут на карте"
+                            className="inline-flex h-9 items-center gap-1 rounded-lg border border-slate-200 px-2.5 text-xs font-semibold text-sky-700 hover:bg-sky-50 dark:border-slate-700 dark:text-sky-400 dark:hover:bg-slate-800 whitespace-nowrap"
+                          >
+                            <MapIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                            <span>На карте</span>
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void Promise.resolve(onDeleteGpxTrack(track.id)).then(() => refreshStorageStats());
+                          }}
+                          aria-label={`Удалить маршрут ${track.name}`}
+                          title="Удалить GPX-маршрут"
+                          className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-400 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 dark:border-slate-700 dark:hover:bg-rose-950/40"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
             )}
           </section>
 
@@ -1474,45 +1753,114 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
               )}
 
               {offlineDownloading && offlineProgress ? (
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between text-[11px] font-medium text-sky-800 tabular-nums dark:text-sky-300">
-                    <span>
-                      Загрузка плиток OSM: {offlineProgress.done} / {offlineProgress.total}
-                    </span>
-                    <span className="font-mono">
-                      {Math.round((offlineProgress.done / Math.max(1, offlineProgress.total)) * 100)}%
-                    </span>
-                  </div>
-                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700">
+                (() => {
+                  const pct = Math.min(
+                    100,
+                    Math.round((offlineProgress.done / Math.max(1, offlineProgress.total)) * 100)
+                  );
+                  return (
                     <div
-                      className="h-full bg-sky-600 transition-all duration-150"
-                      style={{
-                        width: `${Math.min(100, Math.round((offlineProgress.done / Math.max(1, offlineProgress.total)) * 100))}%`,
-                      }}
-                    />
-                  </div>
+                      data-testid="offline-tile-progress"
+                      aria-live="polite"
+                      className="space-y-2 rounded-xl border border-sky-200 bg-sky-50/70 p-3 dark:border-sky-800/80 dark:bg-sky-950/40"
+                    >
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="truncate font-semibold text-sky-900 dark:text-sky-200">
+                          Загрузка: {offlineProgress.regionName}
+                        </span>
+                        <span className="shrink-0 font-mono text-sm font-bold text-sky-700 tabular-nums dark:text-sky-300">
+                          {pct}%
+                        </span>
+                      </div>
+
+                      <div
+                        role="progressbar"
+                        aria-label={`Прогресс загрузки тайлов OSM для региона ${offlineProgress.regionName}`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={pct}
+                        className="h-2.5 w-full overflow-hidden rounded-full bg-sky-200/80 dark:bg-slate-700"
+                      >
+                        <div
+                          className="h-full rounded-full bg-sky-600 transition-all duration-150 dark:bg-sky-400"
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 font-mono text-[11px] text-slate-600 tabular-nums dark:text-slate-300">
+                        <span>
+                          Тайлов: {offlineProgress.done} / {offlineProgress.total} (кэш: {offlineProgress.cached})
+                        </span>
+                        <span>
+                          z{offlineProgress.currentZoom} · {formatPhotoSize(offlineProgress.bytesDownloaded)}
+                        </span>
+                      </div>
+
+                      {offlineProgress.failed > 0 && (
+                        <div className="text-[11px] text-amber-700 dark:text-amber-300 tabular-nums">
+                          Пропущено недоступных фрагментов: {offlineProgress.failed}
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={handleCancelOfflineDownload}
+                        className="w-full rounded-lg border border-slate-300 bg-white py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200"
+                      >
+                        Отменить загрузку
+                      </button>
+                    </div>
+                  );
+                })()
+              ) : (
+                <>
+                  {lastOfflineDownload && (
+                    <div
+                      data-testid="offline-tile-complete"
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-teal-200 bg-teal-50 px-3 py-2 text-xs text-teal-900 dark:border-teal-800 dark:bg-teal-950/50 dark:text-teal-200"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <CheckCircle2 className="h-4 w-4 shrink-0 text-teal-700 dark:text-teal-400" aria-hidden="true" />
+                        <span className="truncate font-medium">
+                          Загружено: <span className="font-bold">{lastOfflineDownload.name}</span> ·{' '}
+                          <span className="font-mono tabular-nums">
+                            {lastOfflineDownload.cached}/{lastOfflineDownload.total} тайлов
+                            {lastOfflineDownload.bytesDownloaded > 0
+                              ? ` (${formatPhotoSize(lastOfflineDownload.bytesDownloaded)})`
+                              : ''}
+                          </span>
+                        </span>
+                      </div>
+                      {onFocusOfflineRegion && (() => {
+                        const savedReg = offlineRegions.find((r) => r.id === lastOfflineDownload.id);
+                        if (!savedReg) return null;
+                        return (
+                          <button
+                            type="button"
+                            onClick={() => onFocusOfflineRegion(savedReg)}
+                            className="shrink-0 font-semibold text-teal-800 underline underline-offset-2 hover:text-teal-950 dark:text-teal-300"
+                          >
+                            Показать на карте
+                          </button>
+                        );
+                      })()}
+                    </div>
+                  )}
+
                   <button
                     type="button"
-                    onClick={handleCancelOfflineDownload}
-                    className="w-full rounded-lg border border-slate-300 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 dark:border-slate-600 dark:text-slate-200"
+                    disabled={!isOnline}
+                    onClick={() => void handleStartOfflineDownload()}
+                    className="inline-flex min-h-[40px] w-full items-center justify-center gap-1.5 rounded-xl bg-sky-700 px-3 py-2 text-xs font-semibold text-white hover:bg-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Отменить загрузку
+                    <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                    {!isOnline
+                      ? 'Нет подключения к сети'
+                      : existingSelectedOfflineRegion
+                        ? 'Обновить фрагменты OSM'
+                        : 'Скачать карту для офлайна'}
                   </button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  disabled={!isOnline}
-                  onClick={() => void handleStartOfflineDownload()}
-                  className="inline-flex min-h-[40px] w-full items-center justify-center gap-1.5 rounded-xl bg-sky-700 px-3 py-2 text-xs font-semibold text-white hover:bg-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Download className="h-3.5 w-3.5" aria-hidden="true" />
-                  {!isOnline
-                    ? 'Нет подключения к сети'
-                    : existingSelectedOfflineRegion
-                      ? 'Обновить фрагменты OSM'
-                      : 'Скачать карту для офлайна'}
-                </button>
+                </>
               )}
             </div>
 
@@ -1719,6 +2067,12 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
                 <dt className="text-slate-500 dark:text-slate-400">Справочники офлайн</dt>
                 <dd className="font-semibold text-slate-800 dark:text-slate-200">
                   {storageStats?.speciesCount || speciesList.length} рыб · {storageStats?.knotsCount ?? 0} узлов · раки
+                </dd>
+              </div>
+              <div className="flex items-center justify-between py-2">
+                <dt className="text-slate-500 dark:text-slate-400">GPX-треки в IndexedDB</dt>
+                <dd className="font-mono font-semibold text-slate-800 tabular-nums dark:text-slate-200">
+                  {storageStats?.gpxTracksCount ?? gpxTracks.length}
                 </dd>
               </div>
               <div className="flex items-center justify-between py-2 gap-2">

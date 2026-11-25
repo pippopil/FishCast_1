@@ -378,6 +378,20 @@ const DEFAULT_ACTIVE_HOURS_BY_SPECIES: Record<string, number[]> = {
   krasnoperka: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
   gustera: [5, 6, 7, 8, 9, 10, 15, 16, 17, 18, 19],
   rotan: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+  ukleyka: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+  verkhovka: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+  peskar: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+  bychok: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+  sazan: [4, 5, 6, 7, 8, 9, 18, 19, 20, 21, 22, 23],
+  ersh: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+  podust: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+  chehon: [5, 6, 7, 8, 9, 16, 17, 18, 19, 20, 21],
+  bersh: [5, 6, 7, 8, 9, 15, 16, 17, 18, 19, 20],
+  elets: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+  bely_amur: [6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20],
+  tolstolobik: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+  sinets: [5, 6, 7, 8, 9, 10, 16, 17, 18, 19, 20],
+  forel: [6, 7, 8, 9, 10, 11, 15, 16, 17, 18],
 };
 
 export function resolveSpeciesActiveHours(species: FishSpecies): number[] {
@@ -1052,26 +1066,68 @@ export function getExpectedFishForWaterBody(params: {
         if (!isSmallIsolated) continue;
       } else if (sp.id === 'karas') {
         if (wb.type === 'river' && (areaHa >= 50 || wb.vegetation_index === 'low')) continue;
+      } else if (sp.id === 'ukleyka') {
+        if (wb.type === 'pond' && areaHa < 2.0 && !isConnected) continue;
+        if (maxD < 1.0) continue;
+      } else if (sp.id === 'verkhovka') {
+        if (wb.type === 'river' || wb.type === 'reservoir') continue;
+        if (areaHa > 120) continue;
+      } else if (sp.id === 'peskar') {
+        if (wb.type === 'pond' || wb.type === 'oxbow' || wb.type === 'quarry') continue;
+        if (wb.type === 'lake' && (wb.water_clarity === 'murky' || areaHa < 15)) continue;
+      } else if (sp.id === 'bychok') {
+        if (maxD < 1.0) continue;
+        if (wb.type === 'pond' && areaHa < 3.0 && !isConnected) continue;
+      } else if (sp.id === 'sazan') {
+        const okRiver = wb.type === 'river' && areaHa >= 45 && maxD >= 3.0;
+        const okRes = wb.type === 'reservoir' && areaHa >= 25 && maxD >= 3.5;
+        const okLake = wb.type === 'lake' && areaHa >= 60 && maxD >= 3.0;
+        if (!okRiver && !okRes && !okLake) continue;
+      } else if (sp.id === 'ersh') {
+        if (maxD < 1.5) continue;
+        if (wb.type === 'pond' && areaHa < 4.0 && !isConnected) continue;
+      } else if (sp.id === 'podust' || sp.id === 'elets') {
+        if (wb.type !== 'river' || areaHa < 10 || wb.water_clarity === 'murky') continue;
+      } else if (sp.id === 'chehon' || sp.id === 'sinets') {
+        const okRiver = wb.type === 'river' && areaHa >= 110 && maxD >= 3.5;
+        const okRes = wb.type === 'reservoir' && areaHa >= 400 && maxD >= 5.5;
+        if (!okRiver && !okRes) continue;
+      } else if (sp.id === 'bersh') {
+        const okRiver = wb.type === 'river' && areaHa >= 160 && maxD >= 5.0;
+        const okRes = wb.type === 'reservoir' && areaHa >= 500 && maxD >= 7.0;
+        if (!okRiver && !okRes) continue;
+      } else if (sp.id === 'bely_amur' || sp.id === 'tolstolobik') {
+        const okPondOrLake = (wb.type === 'pond' || wb.type === 'lake') && areaHa >= 12 && maxD >= 2.2;
+        const okRes = wb.type === 'reservoir' && areaHa >= 20 && maxD >= 3.0;
+        if (!okPondOrLake && !okRes) continue;
+      } else if (sp.id === 'forel') {
+        // Wild trout only in clear cold quarries/rivers or explicitly paid/cataloged waters
+        const okPaid = wb.fishing_access === 'paid';
+        const okColdClear =
+          wb.water_clarity === 'clear' &&
+          ((wb.type === 'quarry' && maxD >= 6.0) || (wb.type === 'river' && areaHa <= 40 && maxD <= 3.0));
+        if (!okPaid && !okColdClear) continue;
       }
 
       let abundance: WaterBodyFishPresence['abundance'] = 'regular';
       if (wb.type === 'pond' || wb.type === 'oxbow') {
-        if (sp.id === 'karas' || (sp.id === 'rotan' && areaHa <= 4)) {
+        if (sp.id === 'karas' || sp.id === 'verkhovka' || (sp.id === 'rotan' && areaHa <= 4)) {
           abundance = 'common';
-        } else if ((sp.id === 'okun' || sp.id === 'plotva') && areaHa >= 3 && maxD >= 1.8) {
+        } else if ((sp.id === 'okun' || sp.id === 'plotva' || sp.id === 'ukleyka') && areaHa >= 3 && maxD >= 1.8) {
           abundance = 'common';
-        } else if (sp.id === 'karp' || sp.id === 'yaz') {
+        } else if (['karp', 'yaz', 'bely_amur', 'tolstolobik', 'forel'].includes(sp.id)) {
           abundance = 'rare';
         }
       } else if (wb.type === 'river') {
-        if (['plotva', 'okun', 'golavl'].includes(sp.id)) {
+        if (['plotva', 'okun', 'golavl', 'ukleyka', 'peskar'].includes(sp.id)) {
           abundance = 'common';
         } else if (sp.id === 'pike' && areaHa >= 20) {
           abundance = 'common';
         } else if (sp.id === 'lesh' && areaHa >= 80 && maxD >= 3.5) {
           abundance = 'common';
         } else if (
-          ['som', 'nalim', 'karas'].includes(sp.id) ||
+          ['som', 'nalim', 'karas', 'forel', 'bersh'].includes(sp.id) ||
+          (sp.id === 'sazan' && areaHa < 100) ||
           (sp.id === 'yaz' && areaHa < 100) ||
           (sp.id === 'zherekh' && areaHa < 150) ||
           (sp.id === 'sudak' && areaHa < 250)
@@ -1080,31 +1136,31 @@ export function getExpectedFishForWaterBody(params: {
         }
       } else if (wb.type === 'reservoir') {
         if (
-          ['okun', 'plotva', 'pike'].includes(sp.id) ||
+          ['okun', 'plotva', 'pike', 'ukleyka', 'ersh'].includes(sp.id) ||
           (sp.id === 'lesh' && areaHa >= 200) ||
           (sp.id === 'sudak' && areaHa >= 400 && maxD >= 7.0)
         ) {
           abundance = 'common';
         } else if (
-          ['som', 'nalim', 'zherekh', 'yaz', 'lin', 'krasnoperka', 'karp'].includes(sp.id) ||
+          ['som', 'nalim', 'zherekh', 'yaz', 'lin', 'krasnoperka', 'karp', 'sazan', 'bely_amur', 'tolstolobik', 'bersh'].includes(sp.id) ||
           (sp.id === 'sudak' && (areaHa < 400 || maxD < 7.0))
         ) {
           abundance = 'rare';
         }
       } else if (wb.type === 'lake') {
         if (
-          ['okun', 'plotva'].includes(sp.id) ||
+          ['okun', 'plotva', 'ukleyka'].includes(sp.id) ||
           (sp.id === 'pike' && areaHa >= 15) ||
           (sp.id === 'karas' && wb.vegetation_index !== 'low')
         ) {
           abundance = 'common';
-        } else if (['sudak', 'nalim', 'karp'].includes(sp.id)) {
+        } else if (['sudak', 'nalim', 'karp', 'sazan', 'bely_amur', 'tolstolobik', 'forel'].includes(sp.id)) {
           abundance = 'rare';
         }
       } else if (wb.type === 'quarry') {
-        if (['okun', 'plotva', 'karas'].includes(sp.id)) {
+        if (['okun', 'plotva', 'karas', 'ukleyka', 'bychok'].includes(sp.id)) {
           abundance = 'common';
-        } else if (['sudak', 'karp', 'lesh'].includes(sp.id)) {
+        } else if (['sudak', 'karp', 'lesh', 'bely_amur', 'forel'].includes(sp.id)) {
           abundance = 'rare';
         }
       }
@@ -1209,8 +1265,21 @@ const SPRING_SPAWN_WINDOWS: Record<string, { spawn: [number, number]; months: nu
   lesh: { spawn: [13.5, 18.0], months: [5, 6] },
   karas: { spawn: [16.0, 19.5], months: [5, 6, 7] },
   karp: { spawn: [18.0, 22.0], months: [5, 6, 7] },
+  sazan: { spawn: [18.0, 22.0], months: [5, 6, 7] },
   som: { spawn: [18.5, 22.5], months: [5, 6, 7] },
   lin: { spawn: [19.0, 23.0], months: [6, 7] },
+  ukleyka: { spawn: [15.0, 19.5], months: [5, 6] },
+  verkhovka: { spawn: [16.0, 20.0], months: [5, 6] },
+  peskar: { spawn: [12.0, 16.0], months: [5, 6] },
+  bychok: { spawn: [12.0, 18.0], months: [4, 5, 6] },
+  ersh: { spawn: [9.0, 13.5], months: [4, 5] },
+  podust: { spawn: [8.0, 12.0], months: [4, 5] },
+  elets: { spawn: [7.0, 11.0], months: [4, 5] },
+  chehon: { spawn: [14.0, 18.0], months: [5, 6] },
+  bersh: { spawn: [12.5, 16.5], months: [4, 5, 6] },
+  sinets: { spawn: [11.0, 15.0], months: [4, 5] },
+  bely_amur: { spawn: [21.0, 25.0], months: [6, 7] },
+  tolstolobik: { spawn: [22.0, 26.0], months: [6, 7] },
 };
 
 export function computeBiologicalPhase(params: {
@@ -3746,4 +3815,273 @@ export function generateBathymetryContours(
 
   return contours;
 }
+
+export interface OptimalDepartureSummary {
+  startIndex: number;
+  endIndex: number;
+  startHour: string;
+  endHour: string;
+  optimalRangeLabel: string;
+  departureTimeLabel: string;
+  peakHour: string;
+  peakSlotKey: string;
+  peakFIndex: number;
+  avgFIndex: number;
+  dayLabel: string;
+  quality: 'optimal' | 'moderate' | 'low';
+  headline: string;
+  subtext: string;
+}
+
+function addHoursToClock(hourInterval: string, deltaMinutes: number): string {
+  const [hStr, mStr] = hourInterval.split(':');
+  const h = Number(hStr);
+  const m = Number(mStr ?? '0');
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return hourInterval;
+  const total = (((h * 60 + m + deltaMinutes) % 1440) + 1440) % 1440;
+  const nh = Math.floor(total / 60);
+  const nm = total % 60;
+  return `${String(nh).padStart(2, '0')}:${String(nm).padStart(2, '0')}`;
+}
+
+/**
+ * Analyzes a 24-hour (or single-day) sequence of 3-hour F-Index slots and identifies
+ * the single best continuous fishing window + recommended departure arrival time.
+ */
+export function buildOptimalDepartureSummary(
+  slots: BiteForecastSlot[]
+): OptimalDepartureSummary | null {
+  if (!Array.isArray(slots) || slots.length === 0) return null;
+
+  let peakIdx = 0;
+  for (let i = 1; i < slots.length; i++) {
+    if (slots[i].f_index > slots[peakIdx].f_index) {
+      peakIdx = i;
+    }
+  }
+  const peak = slots[peakIdx];
+
+  // Expand around peak while contiguous slots stay high (>= 66) or within 8 pts of peak (max 3 slots = 9h)
+  let startIdx = peakIdx;
+  let endIdx = peakIdx;
+  const threshold = peak.f_index >= 66 ? 66 : Math.max(40, peak.f_index - 7);
+
+  while (startIdx > 0 && endIdx - startIdx + 1 < 3 && slots[startIdx - 1].f_index >= threshold) {
+    startIdx -= 1;
+  }
+  while (
+    endIdx < slots.length - 1 &&
+    endIdx - startIdx + 1 < 3 &&
+    slots[endIdx + 1].f_index >= threshold
+  ) {
+    endIdx += 1;
+  }
+
+  // If the best window is a single 3h slot, keep exact 3h span (startHour .. startHour+3h)
+  const windowSlots = slots.slice(startIdx, endIdx + 1);
+  const avgF = Math.round(
+    windowSlots.reduce((sum, s) => sum + s.f_index, 0) / windowSlots.length
+  );
+  const startHour = slots[startIdx].hour_interval;
+  const endHour = addHoursToClock(slots[endIdx].hour_interval, 180);
+  const departureTimeLabel = addHoursToClock(startHour, -30);
+  const optimalRangeLabel = `${startHour}–${endHour}`;
+  const dayLabel = slots[startIdx].day_label;
+
+  const quality: OptimalDepartureSummary['quality'] =
+    peak.f_index >= 66 ? 'optimal' : peak.f_index >= 45 ? 'moderate' : 'low';
+
+  const headline =
+    quality === 'optimal'
+      ? `Оптимальное окно: ${optimalRangeLabel} · выезд к ${departureTimeLabel}`
+      : quality === 'moderate'
+        ? `Рабочее окно: ${optimalRangeLabel} · выезд к ${departureTimeLabel}`
+        : `Слабый фон — лучший шанс в ${optimalRangeLabel}`;
+
+  const subtext =
+    windowSlots.length > 1
+      ? `${dayLabel}: пик F-${peak.f_index} в ${peak.hour_interval}, средний по окну F-${avgF}`
+      : `${dayLabel}: локальный пик F-${peak.f_index} в ${peak.hour_interval}`;
+
+  return {
+    startIndex: startIdx,
+    endIndex: endIdx,
+    startHour,
+    endHour,
+    optimalRangeLabel,
+    departureTimeLabel,
+    peakHour: peak.hour_interval,
+    peakSlotKey: `${peak.date}_${peak.hour_interval}`,
+    peakFIndex: peak.f_index,
+    avgFIndex: avgF,
+    dayLabel,
+    quality,
+    headline,
+    subtext,
+  };
+}
+
+export interface MoonPhaseFishingAdvice {
+  phaseLabel: string;
+  illuminationPct: number;
+  isWaning: boolean;
+  impactLabel: string;
+  tone: 'favorable' | 'caution' | 'neutral';
+  behaviorSummary: string;
+  tacticalTip: string;
+  cloudMitigated: boolean;
+}
+
+/**
+ * Generates concise, actionable fishing advice from the current weather_snapshot's
+ * moon phase, illumination, and cloud cover, optionally adapted to a target fish species.
+ */
+export function buildMoonPhaseFishingAdvice(
+  weather: Pick<WeatherSnapshot, 'moon_phase' | 'moon_illumination' | 'cloud_cover_pct'> | null | undefined,
+  species?: FishSpecies | null
+): MoonPhaseFishingAdvice | null {
+  if (!weather) return null;
+
+  const illuminationPct = Math.max(
+    0,
+    Math.min(100, Math.round(Number(weather.moon_illumination ?? 50)))
+  );
+  const rawPhase = (weather.moon_phase ?? '').trim();
+  const isWaning = /убывающ|последн|стареющ/i.test(rawPhase);
+  const cloudCover = typeof weather.cloud_cover_pct === 'number' ? weather.cloud_cover_pct : 45;
+  const cloudMitigated = illuminationPct >= 68 && cloudCover >= 75;
+
+  const phaseLabel =
+    rawPhase ||
+    (illuminationPct >= 92
+      ? 'Полнолуние'
+      : illuminationPct <= 10
+        ? 'Новолуние'
+        : isWaning
+          ? 'Убывающая луна'
+          : 'Растущая луна');
+
+  const pref = species ? resolveSpeciesLunarPreference(species) : 'balanced';
+  const spTag = species ? ` (${species.name})` : '';
+
+  // 1) Full moon / bright gibbous (>= 75% illumination)
+  if (illuminationPct >= 75) {
+    if (cloudMitigated) {
+      return {
+        phaseLabel,
+        illuminationPct,
+        isWaning,
+        impactLabel: 'Свет смягчён облаками',
+        tone: 'favorable',
+        behaviorSummary: `Плотная облачность (${Math.round(cloudCover)}%) гасит яркий свет Луны — рыба меньше осторожничает днём${spTag}.`,
+        tacticalTip: 'Смело облавливайте средние глубины и бровки с утра до полудня.',
+        cloudMitigated: true,
+      };
+    }
+
+    if (pref === 'bright_moon') {
+      return {
+        phaseLabel,
+        illuminationPct,
+        isWaning,
+        impactLabel: 'Активные сумерки',
+        tone: 'favorable',
+        behaviorSummary: `Яркая Луна (${illuminationPct}%) продлевает ночную и предрассветную кормёжку${spTag} на мелководных поливах.`,
+        tacticalTip: 'Выходите до рассвета и в вечерние сумерки; держитесь выходов из ям на стол.',
+        cloudMitigated: false,
+      };
+    }
+
+    if (pref === 'dark_moon' || species?.category === 'predator') {
+      return {
+        phaseLabel,
+        illuminationPct,
+        isWaning,
+        impactLabel: 'Осторожный дневной клёв',
+        tone: 'caution',
+        behaviorSummary: `Высокая ночная освещённость (${illuminationPct}%) даёт рыбе кормиться ночью — днём хищник сыт и пуглив${spTag}.`,
+        tacticalTip: 'Делайте ставку на рассвет, закат и теневые бровки; уменьшайте размер приманки и толщину поводка.',
+        cloudMitigated: false,
+      };
+    }
+
+    return {
+      phaseLabel,
+      illuminationPct,
+      isWaning,
+      impactLabel: 'Пики на зорях',
+      tone: 'caution',
+      behaviorSummary: `Яркая Луна (${illuminationPct}%) смещает кормёжку на ночь и рассвет, ослабляя полуденный клёв.`,
+      tacticalTip: 'Ловите на границе света и тени, у камыша и на глубинных свалах в первые 2–3 часа после восхода.',
+      cloudMitigated: false,
+    };
+  }
+
+  // 2) New moon / dark crescent (<= 25% illumination)
+  if (illuminationPct <= 25) {
+    if (pref === 'dark_moon' || species?.category === 'predator') {
+      return {
+        phaseLabel,
+        illuminationPct,
+        isWaning,
+        impactLabel: 'Сильный дневной выход',
+        tone: 'favorable',
+        behaviorSummary: `Тёмные ночи (${illuminationPct}%) мешают ночной охоте — днём рыба голоднее и смелее выходит за кормом${spTag}.`,
+        tacticalTip: 'Хорошо работают активные проводки, заметные контрастные приманки и облов мелководных бровок днём.',
+        cloudMitigated: false,
+      };
+    }
+
+    if (pref === 'bright_moon') {
+      return {
+        phaseLabel,
+        illuminationPct,
+        isWaning,
+        impactLabel: 'Смещение на светлый день',
+        tone: 'neutral',
+        behaviorSummary: `Слабая ночная освещённость (${illuminationPct}%) переносит активность${spTag} с ночи на тёплые дневные часы.`,
+        tacticalTip: 'Усильте ароматику прикормки и облавливайте прогретые солнцем участки с 09:00 до 16:00.',
+        cloudMitigated: false,
+      };
+    }
+
+    return {
+      phaseLabel,
+      illuminationPct,
+      isWaning,
+      impactLabel: 'Благоприятно днём',
+      tone: 'favorable',
+      behaviorSummary: `Низкая ночная освещённость (${illuminationPct}%) удерживает основной пик кормёжки в светлое время суток.`,
+      tacticalTip: 'Работают стабильные дневные выходы; хищник и бель держатся ближе к кормовым бровкам.',
+      cloudMitigated: false,
+    };
+  }
+
+  // 3) Growing / Waxing quarter (26%..74% waxing)
+  if (!isWaning) {
+    return {
+      phaseLabel,
+      illuminationPct,
+      isWaning: false,
+      impactLabel: 'Рост активности',
+      tone: 'favorable',
+      behaviorSummary: `Растущая Луна (${illuminationPct}%) создаёт мягкую освещённость — рыба стабильно кормится на зорях и днём${spTag}.`,
+      tacticalTip: 'Оптимальное время для поиска активной рыбы на бровках и поливах без лишней осторожности.',
+      cloudMitigated: false,
+    };
+  }
+
+  // 4) Waning quarter (26%..74% waning)
+  return {
+    phaseLabel,
+    illuminationPct,
+    isWaning: true,
+    impactLabel: 'Ровный фон',
+    tone: 'neutral',
+    behaviorSummary: `Убывающая освещённость (${illuminationPct}%) снижает пугливость рыбы на мелководье${spTag}.`,
+    tacticalTip: 'Ориентируйтесь на стабильное давление и утреннюю зорю; подача приманки лучше плавная.',
+    cloudMitigated: false,
+  };
+}
+
 

@@ -4,6 +4,7 @@ import {
   Bell,
   Car,
   CheckCircle2,
+  Clock,
   Compass,
   Download,
   ExternalLink,
@@ -32,8 +33,7 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
-  Line,
-  LineChart,
+  ReferenceArea,
   ReferenceDot,
   ReferenceLine,
   ResponsiveContainer,
@@ -43,6 +43,7 @@ import {
 } from 'recharts';
 import {
   buildBathymetryProfile,
+  buildOptimalDepartureSummary,
   buildSampleSonarCsv,
   getExcludedVerifiedSpecies,
   getExpectedFishForWaterBody,
@@ -122,6 +123,7 @@ type ChartSlotPoint = BiteForecastSlot & { slotKey: string; chartLabel: string }
 const SOURCE_LABELS: Record<WaterBody['source'], string> = {
   registry: 'Госводреестр',
   osm: 'OpenStreetMap',
+  google_places: 'Google Карты',
   satellite: 'Sentinel-2 NDWI',
   user: 'Краудсорсинг',
 };
@@ -557,6 +559,11 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
   const activeSlot =
     chartSlots.find((s) => s.slotKey === selectedSlotKey) ?? peakSlot;
 
+  const optimalDeparture = useMemo(
+    () => buildOptimalDepartureSummary(chartSlots),
+    [chartSlots]
+  );
+
   const handleDepthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setDepthError(null);
@@ -628,6 +635,20 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
               >
                 {crayfishPresence.compactBadge}
               </span>
+              {waterBody.google_maps_uri && (
+                <>
+                  <span aria-hidden="true"> · </span>
+                  <a
+                    href={waterBody.google_maps_uri}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-0.5 font-semibold text-sky-700 hover:underline dark:text-sky-400"
+                  >
+                    <span>Google Карты</span>
+                    <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                  </a>
+                </>
+              )}
             </p>
           </div>
 
@@ -1402,10 +1423,64 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                   <div className="mt-4 text-xs text-slate-500">Обновляем прогноз...</div>
                 ) : chartSlots.length > 0 ? (
                   <>
-                    {/* Recharts 24h F-Index Line Chart */}
-                    <div className="mt-3 h-[184px] w-full" data-testid="findex-24h-chart">
-                      <ResponsiveContainer width="100%" height={180}>
-                        <LineChart
+                    {/* Optimal departure window banner for next 24h / selected day */}
+                    {optimalDeparture && (
+                      <div
+                        data-testid="findex-optimal-window"
+                        className={`mt-2.5 flex items-start justify-between gap-2.5 rounded-xl border px-3 py-2 text-[11px] ${
+                          optimalDeparture.quality === 'optimal'
+                            ? 'border-teal-200/90 bg-teal-50/75 text-teal-950 dark:border-teal-800/70 dark:bg-teal-950/35 dark:text-teal-100'
+                            : optimalDeparture.quality === 'moderate'
+                              ? 'border-sky-200/90 bg-sky-50/70 text-sky-950 dark:border-sky-800/70 dark:bg-sky-950/35 dark:text-sky-100'
+                              : 'border-slate-200 bg-slate-50 text-slate-800 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-200'
+                        }`}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 font-semibold">
+                            <Clock
+                              className={`h-3.5 w-3.5 shrink-0 ${
+                                optimalDeparture.quality === 'optimal'
+                                  ? 'text-teal-700 dark:text-teal-400'
+                                  : optimalDeparture.quality === 'moderate'
+                                    ? 'text-sky-700 dark:text-sky-400'
+                                    : 'text-slate-500'
+                              }`}
+                              aria-hidden="true"
+                            />
+                            <span className="tabular-nums">{optimalDeparture.headline}</span>
+                          </div>
+                          <div className="mt-0.5 text-[10px] text-slate-600 dark:text-slate-300 tabular-nums">
+                            {optimalDeparture.subtext}
+                          </div>
+                        </div>
+                        {activeSlot.slotKey !== optimalDeparture.peakSlotKey && (
+                          <button
+                            type="button"
+                            onClick={() => setSelectedSlotKey(optimalDeparture.peakSlotKey)}
+                            className="shrink-0 self-center rounded-md px-2 py-1 text-[10px] font-semibold text-teal-700 underline underline-offset-2 hover:text-teal-900 dark:text-teal-300 whitespace-nowrap"
+                          >
+                            К пику
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Chart caption */}
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                      <span className="font-semibold text-slate-800 dark:text-slate-200">
+                        {effectiveSelectedDay === '24h'
+                          ? 'Динамика F-Индекса (ближайшие 24 ч)'
+                          : `Динамика F-Индекса (${chartSlots[0]?.day_label ?? ''})`}
+                      </span>
+                      <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400 tabular-nums">
+                        Оптимум ≥ 66 · шаг 3 ч
+                      </span>
+                    </div>
+
+                    {/* Recharts 24h F-Index Dynamics Area Chart */}
+                    <div className="mt-1.5 h-[196px] w-full" data-testid="findex-24h-chart">
+                      <ResponsiveContainer width="100%" height={192}>
+                        <AreaChart
                           data={chartSlots}
                           margin={{ top: 12, right: 12, left: -20, bottom: 2 }}
                           onClick={(state) => {
@@ -1415,6 +1490,13 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                             }
                           }}
                         >
+                          <defs>
+                            <linearGradient id="fIndexAreaGrad" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#0D9488" stopOpacity={0.34} />
+                              <stop offset="55%" stopColor="#0284C7" stopOpacity={0.14} />
+                              <stop offset="98%" stopColor="#0284C7" stopOpacity={0.02} />
+                            </linearGradient>
+                          </defs>
                           <CartesianGrid strokeDasharray="3 3" stroke="#CBD5E1" strokeOpacity={0.45} />
                           <XAxis
                             dataKey="chartLabel"
@@ -1429,11 +1511,39 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                             axisLine={false}
                             tickLine={false}
                           />
+                          {/* Shaded optimal F >= 66 zone */}
+                          <ReferenceArea
+                            y1={66}
+                            y2={100}
+                            fill="#0D9488"
+                            fillOpacity={0.07}
+                            ifOverflow="extendDomain"
+                          />
+                          {/* Highlighted best contiguous departure window on X-axis */}
+                          {optimalDeparture &&
+                            optimalDeparture.endIndex > optimalDeparture.startIndex &&
+                            chartSlots[optimalDeparture.startIndex] &&
+                            chartSlots[optimalDeparture.endIndex] && (
+                              <ReferenceArea
+                                x1={chartSlots[optimalDeparture.startIndex].chartLabel}
+                                x2={chartSlots[optimalDeparture.endIndex].chartLabel}
+                                fill={optimalDeparture.quality === 'optimal' ? '#0D9488' : '#0284C7'}
+                                fillOpacity={0.12}
+                                ifOverflow="extendDomain"
+                              />
+                            )}
                           <ReferenceLine
                             y={66}
                             stroke="#0D9488"
                             strokeDasharray="4 3"
-                            strokeOpacity={0.75}
+                            strokeOpacity={0.85}
+                            label={{
+                              value: 'F-66',
+                              position: 'insideTopRight',
+                              fill: '#0D9488',
+                              fontSize: 9,
+                              fontWeight: 700,
+                            }}
                           />
                           <Tooltip
                             content={({ active, payload }) => {
@@ -1475,14 +1585,44 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                               );
                             }}
                           />
-                          <Line
+                          <Area
                             type="monotone"
                             dataKey="f_index"
                             stroke="#0284C7"
                             strokeWidth={2.5}
-                            dot={{ r: 3.5, fill: '#0284C7', stroke: '#FFFFFF', strokeWidth: 1.5 }}
-                            activeDot={{ r: 5.5, fill: '#0F172A', stroke: '#FFFFFF', strokeWidth: 2 }}
+                            fill="url(#fIndexAreaGrad)"
                             isAnimationActive={false}
+                            dot={(dotProps: {
+                              cx?: number;
+                              cy?: number;
+                              payload?: ChartSlotPoint;
+                            }) => {
+                              const { cx, cy, payload } = dotProps;
+                              if (typeof cx !== 'number' || typeof cy !== 'number' || !payload) {
+                                return <g key="empty-f" />;
+                              }
+                              const isSelectedDot = activeSlot.slotKey === payload.slotKey;
+                              const isHigh = payload.f_index >= 66;
+                              const fill = isSelectedDot
+                                ? '#0F172A'
+                                : isHigh
+                                  ? '#0D9488'
+                                  : payload.f_index >= 40
+                                    ? '#0284C7'
+                                    : '#94A3B8';
+                              return (
+                                <circle
+                                  key={payload.slotKey}
+                                  cx={cx}
+                                  cy={cy}
+                                  r={isSelectedDot ? 5 : isHigh ? 4 : 3.2}
+                                  fill={fill}
+                                  stroke="#FFFFFF"
+                                  strokeWidth={1.6}
+                                />
+                              );
+                            }}
+                            activeDot={{ r: 6, fill: '#0F172A', stroke: '#FFFFFF', strokeWidth: 2 }}
                           />
                           <ReferenceDot
                             x={peakSlot.chartLabel}
@@ -1492,8 +1632,16 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                             stroke="#FFFFFF"
                             strokeWidth={2}
                           />
-                        </LineChart>
+                        </AreaChart>
                       </ResponsiveContainer>
+                    </div>
+
+                    {/* Minimal typographic legend */}
+                    <div className="mt-1 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-500 dark:text-slate-400">
+                      <span>Нажмите на точку графика или час ниже для разбора погоды</span>
+                      <span className="font-mono tabular-nums">
+                        Пик: <strong className="text-teal-700 dark:text-teal-400">F-{peakSlot.f_index}</strong> ({peakSlot.hour_interval})
+                      </span>
                     </div>
 
                     {/* Synchronized Atmospheric Pressure Chart (mmHg + sharp swing indicators) */}

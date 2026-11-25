@@ -10,6 +10,14 @@ import {
   haversineMeters,
   windDegreesToLabel,
 } from '../lib/fishLogic.ts';
+import {
+  groupOuterAndInnerRings,
+  isSyntheticPlaceholderPolygon,
+  normalizeRingWinding,
+  simplifyClosedRingRDP,
+  simplifyPolylineRDP,
+  stitchOsmRelationWays,
+} from '../lib/waterGeometry.ts';
 import type {
   BiteForecastResponse,
   CatchReport,
@@ -882,7 +890,20 @@ const OSM_SPECIES_TOKENS: Array<{ id: string; patterns: RegExp }> = [
   { id: 'chub', patterns: /(?:^|[^\p{L}])(голавл\p{L}*|chub|squalius)(?:$|[^\p{L}])/iu },
   { id: 'burbot', patterns: /(?:^|[^\p{L}])(налим\p{L}*|burbot|lota)(?:$|[^\p{L}])/iu },
   { id: 'tench', patterns: /(?:^|[^\p{L}])(лин[ьяею]\p{L}*|tench|tinca)(?:$|[^\p{L}])/iu },
-  { id: 'trout', patterns: /(?:^|[^\p{L}])(форел\p{L}*|trout|oncorhynchus|salmo)(?:$|[^\p{L}])/iu },
+  { id: 'forel', patterns: /(?:^|[^\p{L}])(форел\p{L}*|trout|oncorhynchus|salmo)(?:$|[^\p{L}])/iu },
+  { id: 'ukleyka', patterns: /(?:^|[^\p{L}])(уклейк\p{L}*|себел\p{L}*|верховодк\p{L}*|bleak|alburnus)(?:$|[^\p{L}])/iu },
+  { id: 'verkhovka', patterns: /(?:^|[^\p{L}])(верховк\p{L}*|овсянк\p{L}*|leucaspius)(?:$|[^\p{L}])/iu },
+  { id: 'peskar', patterns: /(?:^|[^\p{L}])(пескар\p{L}*|gudgeon|gobio)(?:$|[^\p{L}])/iu },
+  { id: 'bychok', patterns: /(?:^|[^\p{L}])(быч[ое]?к\p{L}*|подкаменщик\p{L}*|goby|neogobius)(?:$|[^\p{L}])/iu },
+  { id: 'sazan', patterns: /(?:^|[^\p{L}])(сазан\p{L}*)(?:$|[^\p{L}])/iu },
+  { id: 'ersh', patterns: /(?:^|[^\p{L}])([её]рш\p{L}*|ruffe|gymnocephalus)(?:$|[^\p{L}])/iu },
+  { id: 'podust', patterns: /(?:^|[^\p{L}])(подуст\p{L}*|nase|chondrostoma)(?:$|[^\p{L}])/iu },
+  { id: 'chehon', patterns: /(?:^|[^\p{L}])(чехон\p{L}*|pelecus)(?:$|[^\p{L}])/iu },
+  { id: 'bersh', patterns: /(?:^|[^\p{L}])(берш\p{L}*|sander volgensis)(?:$|[^\p{L}])/iu },
+  { id: 'elets', patterns: /(?:^|[^\p{L}])(елец|ельц\p{L}*|dace|leuciscus leuciscus)(?:$|[^\p{L}])/iu },
+  { id: 'bely_amur', patterns: /(?:^|[^\p{L}])(бел\p{L}*\s+амур\p{L}*|амур\p{L}*|grass carp|ctenopharyngodon)(?:$|[^\p{L}])/iu },
+  { id: 'tolstolobik', patterns: /(?:^|[^\p{L}])(толстолоб\p{L}*|silver carp|hypophthalmichthys)(?:$|[^\p{L}])/iu },
+  { id: 'sinets', patterns: /(?:^|[^\p{L}])(синец|синц\p{L}*|ballerus)(?:$|[^\p{L}])/iu },
 ];
 
 function parseOsmMetersValue(raw?: string): number | null {
@@ -1068,62 +1089,48 @@ function computePolygonAreaHa(ring: [number, number][]): number {
   return Math.max(0.2, Number((Math.abs(area2) / 20000).toFixed(1)));
 }
 
-function downsampleRing(ring: [number, number][], maxVertices = 260): [number, number][] {
+function downsampleRing(ring: [number, number][], maxVertices = 360): [number, number][] {
   if (!Array.isArray(ring) || ring.length < 3) return [];
+  const simplified = simplifyClosedRingRDP(ring, 0.00005, maxVertices);
+  if (simplified.length >= 4) return simplified;
   const raw = ring.map(([x, y]) => [Number(x.toFixed(5)), Number(y.toFixed(5))] as [number, number]);
-  let sampled: [number, number][];
-  if (raw.length <= maxVertices) {
-    sampled = raw;
-  } else {
-    const step = (raw.length - 1) / (maxVertices - 1);
-    sampled = [];
-    for (let i = 0; i < maxVertices - 1; i++) {
-      sampled.push(raw[Math.round(i * step)]);
-    }
-    sampled.push(raw[raw.length - 1]);
+  if (raw.length >= 3) {
+    const f = raw[0];
+    const l = raw[raw.length - 1];
+    if (f[0] !== l[0] || f[1] !== l[1]) raw.push([f[0], f[1]]);
   }
-  if (sampled.length >= 3) {
-    const f = sampled[0];
-    const l = sampled[sampled.length - 1];
-    if (f[0] !== l[0] || f[1] !== l[1]) {
-      sampled.push([f[0], f[1]]);
-    }
-  }
-  return sampled;
+  return raw;
 }
 
 function buildPolygonFromLineNodes(
   nodes: Array<{ lat: number; lon: number }>,
   halfWidthM = 28
-): { polygon: [number, number][]; center: LatLng; lengthKm: number } {
-  const deduped: Array<{ lat: number; lon: number }> = [];
+): { polygon: [number, number][]; line: [number, number][]; center: LatLng; lengthKm: number } {
+  const rawLine: [number, number][] = [];
   let totalLengthM = 0;
   for (const n of nodes) {
-    const prev = deduped[deduped.length - 1];
+    const prev = rawLine[rawLine.length - 1];
     if (!prev) {
-      deduped.push(n);
+      rawLine.push([Number(n.lon.toFixed(5)), Number(n.lat.toFixed(5))]);
     } else {
-      const segM = haversineMeters({ lat: prev.lat, lng: prev.lon }, { lat: n.lat, lng: n.lon });
-      if (segM >= 35) {
+      const segM = haversineMeters({ lat: prev[1], lng: prev[0] }, { lat: n.lat, lng: n.lon });
+      if (segM >= 12) {
         totalLengthM += segM;
-        deduped.push(n);
+        rawLine.push([Number(n.lon.toFixed(5)), Number(n.lat.toFixed(5))]);
       }
     }
   }
-  const step = Math.max(1, Math.floor(deduped.length / 75));
-  const sampled: Array<{ lat: number; lon: number }> = [];
-  for (let i = 0; i < deduped.length; i += step) {
-    sampled.push(deduped[i]);
-  }
-  if (deduped.length > 0 && sampled[sampled.length - 1] !== deduped[deduped.length - 1]) {
-    sampled.push(deduped[deduped.length - 1]);
-  }
+  // Use Ramer-Douglas-Peucker simplification so river bends & meanders stay 100% faithful to the water channel
+  const simplifiedLine = simplifyPolylineRDP(rawLine, 0.00006);
+  const sampled = simplifiedLine.map(([lon, lat]) => ({ lat, lon }));
+
   if (sampled.length < 2) {
     const pt = nodes[0] ?? { lat: 55.975, lon: 36.825 };
     const r = 0.0008;
     return {
       center: { lat: Number(pt.lat.toFixed(5)), lng: Number(pt.lon.toFixed(5)) },
       lengthKm: 0.3,
+      line: [[Number(pt.lon.toFixed(5)), Number(pt.lat.toFixed(5))]],
       polygon: [
         [Number((pt.lon - r).toFixed(6)), Number(pt.lat.toFixed(6))],
         [Number(pt.lon.toFixed(6)), Number((pt.lat - r * 0.7).toFixed(6))],
@@ -1157,6 +1164,7 @@ function buildPolygonFromLineNodes(
   const mid = sampled[Math.floor(sampled.length / 2)];
   return {
     polygon: ring,
+    line: simplifiedLine,
     center: { lat: Number(mid.lat.toFixed(5)), lng: Number(mid.lon.toFixed(5)) },
     lengthKm: Number((totalLengthM / 1000).toFixed(2)),
   };
@@ -1164,7 +1172,7 @@ function buildPolygonFromLineNodes(
 
 function buildClosedPolygonFromNodes(nodes: Array<{ lat: number; lon: number }>): [number, number][] {
   const coords = nodes.map((n) => [n.lon, n.lat] as [number, number]);
-  const ring = downsampleRing(coords, 220);
+  const ring = normalizeRingWinding(downsampleRing(coords, 360), true);
   if (ring.length >= 4) return ring;
   return buildPolygonFromLineNodes(nodes).polygon;
 }
@@ -1184,7 +1192,8 @@ export function buildWaterBodyFromGeocodeFeature(params: {
     isCanalOrMajorRiver: params.isCanalOrMajorRiver,
     isStream: params.isStream,
   });
-  // Compact octagon marker when exact shoreline geometry is unavailable (never draw fake bounding-box rectangles over dry land)
+  // Marked as 'approximate' so FishMap renders a clean water pin on the water coordinate
+  // instead of painting a fake octagon over surrounding dry land.
   const rLng = 0.0011;
   const rLat = 0.0007;
   const polygon: [number, number][] = [];
@@ -1204,6 +1213,7 @@ export function buildWaterBodyFromGeocodeFeature(params: {
     type: params.type,
     center: { lat: Number(params.lat.toFixed(5)), lng: Number(params.lng.toFixed(5)) },
     polygon,
+    geometry_quality: 'approximate',
     area_ha: Math.round(defaults.area * 10) / 10,
     source: 'osm',
     confidence: 0.84,
@@ -1222,11 +1232,19 @@ export function buildWaterBodyFromGeocodeFeature(params: {
 }
 
 interface OverpassElement {
-  type: 'way' | 'relation';
+  type: 'node' | 'way' | 'relation';
   id: number;
+  lat?: number;
+  lon?: number;
   tags?: Record<string, string>;
   center?: { lat: number; lon: number };
   geometry?: Array<{ lat: number; lon: number }>;
+  members?: Array<{
+    type?: string;
+    ref?: number;
+    role?: string;
+    geometry?: Array<{ lat: number; lon: number }>;
+  }>;
   bounds?: { minlat: number; minlon: number; maxlat: number; maxlon: number };
 }
 
@@ -1291,6 +1309,7 @@ const VALID_WATER_VALUES = new Set([
   'canal',
   'riverbank',
   'stream',
+  'fishing',
 ]);
 
 export function isPhotonWaterFeature(props?: PhotonFeature['properties']): boolean {
@@ -1299,7 +1318,8 @@ export function isPhotonWaterFeature(props?: PhotonFeature['properties']): boole
   const v = (props.osm_value ?? '').toLowerCase();
   if (NON_FISHABLE_WATERWAY_VALUES.has(v)) return false;
   if (k === 'water') return true;
-  if (k === 'landuse' && v === 'reservoir') return true;
+  if (k === 'landuse' && (v === 'reservoir' || v === 'basin')) return true;
+  if (k === 'leisure' && v === 'fishing') return true;
   if (k === 'natural' && ['water', 'bay'].includes(v)) return true;
   if (k === 'waterway') return ['river', 'canal', 'stream', 'oxbow', 'riverbank'].includes(v);
   return VALID_WATER_VALUES.has(v);
@@ -1321,6 +1341,9 @@ function extractGeometryFromNominatim(
 ): {
   polygon: [number, number][];
   polygon_rings?: [number, number][][];
+  polygon_parts?: [number, number][][][];
+  river_lines?: [number, number][][];
+  geometry_quality: 'exact' | 'centerline';
   center: LatLng;
   areaHa?: number;
   lengthKm?: number;
@@ -1331,13 +1354,27 @@ function extractGeometryFromNominatim(
   if (g.type === 'Polygon') {
     const coords = g.coordinates as [number, number][][];
     if (!Array.isArray(coords) || coords.length === 0 || coords[0].length < 4) return null;
-    const rings = coords.map((r) => downsampleRing(r, 260)).filter((r) => r.length >= 4);
-    if (rings.length === 0) return null;
+    const outer = normalizeRingWinding(downsampleRing(coords[0], 360), true);
+    if (outer.length < 4) return null;
+    const holes = coords
+      .slice(1)
+      .map((r) => normalizeRingWinding(downsampleRing(r, 200), false))
+      .filter((r) => r.length >= 4);
+    const rings = [outer, ...holes];
     const center = findInteriorWaterPoint(rings, anchor);
-    const areaHa = computePolygonAreaHa(rings[0]);
+    const areaHa = Math.max(
+      0.2,
+      Number(
+        (
+          computePolygonAreaHa(outer) -
+          holes.reduce((sum, h) => sum + computePolygonAreaHa(h), 0)
+        ).toFixed(1)
+      )
+    );
     return {
-      polygon: rings[0],
+      polygon: outer,
       ...(rings.length > 1 ? { polygon_rings: rings } : {}),
+      geometry_quality: 'exact',
       center,
       areaHa,
     };
@@ -1346,16 +1383,27 @@ function extractGeometryFromNominatim(
   if (g.type === 'MultiPolygon') {
     const polys = g.coordinates as [number, number][][][];
     if (!Array.isArray(polys) || polys.length === 0) return null;
-    // Choose the polygon with the largest actual outer area (or total area summed across parts)
+    // Preserve ALL valid water parts (with island cutouts) so multi-basin reservoirs & riverbanks
+    // highlight exact water surfaces without ever bridging across dry land!
     let totalAreaHa = 0;
     let bestRings: [number, number][][] | null = null;
     let bestScore = -1;
+    const allParts: [number, number][][][] = [];
     for (const poly of polys) {
       if (!poly || poly.length === 0 || poly[0].length < 4) continue;
-      const rings = poly.map((r) => downsampleRing(r, 260)).filter((r) => r.length >= 4);
-      if (rings.length === 0) continue;
-      const aHa = computePolygonAreaHa(rings[0]);
+      const outer = normalizeRingWinding(downsampleRing(poly[0], 340), true);
+      if (outer.length < 4) continue;
+      const holes = poly
+        .slice(1)
+        .map((r) => normalizeRingWinding(downsampleRing(r, 180), false))
+        .filter((r) => r.length >= 4);
+      const rings = [outer, ...holes];
+      const aHa = Math.max(
+        0.1,
+        computePolygonAreaHa(outer) - holes.reduce((sum, h) => sum + computePolygonAreaHa(h), 0)
+      );
       totalAreaHa += aHa;
+      allParts.push(rings);
       const pt = findInteriorWaterPoint(rings, anchor);
       const distKm = haversineMeters(anchor, pt) / 1000;
       const score = aHa / (1 + distKm * 0.08);
@@ -1364,11 +1412,13 @@ function extractGeometryFromNominatim(
         bestRings = rings;
       }
     }
-    if (!bestRings) return null;
+    if (!bestRings || allParts.length === 0) return null;
     const center = findInteriorWaterPoint(bestRings, anchor);
     return {
       polygon: bestRings[0],
       ...(bestRings.length > 1 ? { polygon_rings: bestRings } : {}),
+      ...(allParts.length > 1 ? { polygon_parts: allParts } : {}),
+      geometry_quality: 'exact',
       center,
       areaHa: Math.max(0.5, Number(totalAreaHa.toFixed(1))),
     };
@@ -1379,18 +1429,24 @@ function extractGeometryFromNominatim(
       g.type === 'LineString'
         ? [g.coordinates as [number, number][]]
         : (g.coordinates as [number, number][][]);
-    // Pick the longest continuous segment near anchor (within 24 km), falling back to the nearest segment
+    // Keep all local segments near anchor (within 28 km) as clean RDP river centerlines
+    // so the river highlights strictly along its real winding channel, NEVER cutting across land!
     let bestLine: [number, number][] = [];
     let bestDist = Infinity;
     let totalRelationLenKm = 0;
+    const localCenterlines: [number, number][][] = [];
     for (const line of rawLines) {
       if (!Array.isArray(line) || line.length < 2) continue;
       for (let i = 1; i < line.length; i++) {
         totalRelationLenKm +=
           haversineMeters({ lat: line[i - 1][1], lng: line[i - 1][0] }, { lat: line[i][1], lng: line[i][0] }) / 1000;
       }
-      const nearPts = line.filter((pt) => haversineMeters(anchor, { lat: pt[1], lng: pt[0] }) <= 24000);
+      const nearPts = line.filter((pt) => haversineMeters(anchor, { lat: pt[1], lng: pt[0] }) <= 28000);
       const candidate = nearPts.length >= 2 ? nearPts : line;
+      if (nearPts.length >= 2) {
+        const simp = simplifyPolylineRDP(nearPts, 0.00006);
+        if (simp.length >= 2) localCenterlines.push(simp);
+      }
       let minLineDist = Infinity;
       for (const pt of candidate) {
         const d = haversineMeters(anchor, { lat: pt[1], lng: pt[0] });
@@ -1405,7 +1461,7 @@ function extractGeometryFromNominatim(
       const effectiveLenKm = Math.max(totalRelationLenKm, 1);
       const isLargeChannel = majorWaterway || effectiveLenKm >= 95;
       const isMediumRiver = !isLargeChannel && effectiveLenKm >= 38;
-      const halfWidthM = isLargeChannel ? 42 : isMediumRiver ? 18 : 10;
+      const halfWidthM = isLargeChannel ? 36 : isMediumRiver ? 16 : 9;
       const buf = buildPolygonFromLineNodes(
         bestLine.map(([lon, lat]) => ({ lat, lon })),
         halfWidthM
@@ -1418,8 +1474,11 @@ function extractGeometryFromNominatim(
           Math.round((sampledLenKm * 1000 * halfWidthM * 2) / 10000)
         )
       );
+      const riverLines = localCenterlines.length > 0 ? localCenterlines.slice(0, 12) : [buf.line];
       return {
         polygon: buf.polygon,
+        river_lines: riverLines,
+        geometry_quality: 'centerline',
         center: buf.center,
         areaHa: estimatedHa,
         lengthKm: Number(Math.max(buf.lengthKm, totalRelationLenKm).toFixed(1)),
@@ -1509,6 +1568,9 @@ function buildWaterBodyFromPhotonFeature(
     target_zone: center,
     polygon: extracted?.polygon ?? base.polygon,
     ...(extracted?.polygon_rings ? { polygon_rings: extracted.polygon_rings } : {}),
+    ...(extracted?.polygon_parts ? { polygon_parts: extracted.polygon_parts } : {}),
+    ...(extracted?.river_lines ? { river_lines: extracted.river_lines } : {}),
+    geometry_quality: extracted ? extracted.geometry_quality : 'approximate',
     area_ha: Math.round(defaults.area * 10) / 10,
     max_depth_m: defaults.max,
     avg_depth_m: defaults.avg,
@@ -1595,6 +1657,9 @@ function buildWaterBodyFromNominatimSearchItem(
     target_zone: extracted.center,
     polygon: extracted.polygon,
     ...(extracted.polygon_rings ? { polygon_rings: extracted.polygon_rings } : {}),
+    ...(extracted.polygon_parts ? { polygon_parts: extracted.polygon_parts } : {}),
+    ...(extracted.river_lines ? { river_lines: extracted.river_lines } : {}),
+    geometry_quality: extracted.geometry_quality,
     area_ha: Math.round(defaults.area * 10) / 10,
     max_depth_m: defaults.max,
     avg_depth_m: defaults.avg,
@@ -1627,7 +1692,8 @@ async function fetchNominatimLookup(osmIds: string[]): Promise<Map<string, Nomin
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5500);
   try {
-    const url = `https://nominatim.openstreetmap.org/lookup?osm_ids=${osmIds.slice(0, 30).join(',')}&format=jsonv2&polygon_geojson=1&polygon_threshold=0.001`;
+    // High-precision polygon_threshold=0.00006 (~6 m) so shorelines never slice across dry land!
+    const url = `https://nominatim.openstreetmap.org/lookup?osm_ids=${osmIds.slice(0, 30).join(',')}&format=jsonv2&polygon_geojson=1&polygon_threshold=0.00006`;
     const res = await fetch(url, {
       headers: { 'User-Agent': 'FishCastAI/1.0' },
       signal: controller.signal,
@@ -1655,7 +1721,7 @@ async function fetchNominatimSearch(queryText: string): Promise<NominatimLookupI
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4500);
   try {
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(queryText.trim())}&format=jsonv2&polygon_geojson=1&polygon_threshold=0.001&limit=6`;
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(queryText.trim())}&format=jsonv2&polygon_geojson=1&polygon_threshold=0.00006&limit=6`;
     const res = await fetch(url, {
       headers: { 'User-Agent': 'FishCastAI/1.0', 'Accept-Language': 'ru,en' },
       signal: controller.signal,
@@ -1676,35 +1742,43 @@ async function fetchOverpassMetadata(
   radiusM: number,
   majorOnly = false
 ): Promise<OverpassElement[]> {
-  // Fast tags+center+bb query (includes RELATIONS for reservoirs, large lakes, canals, major rivers, plus dams & local lakes)
-  const localRadiusM = Math.min(7000, radiusM);
+  // Request exact `out tags geom` so lakes, ponds, quarries, riverbanks, dams, and river channels
+  // receive genuine OSM water contours directly instead of falling back to octagons over dry land.
+  const localRadiusM = Math.min(9500, radiusM);
   const qlLines = [
-    '[out:json][timeout:5];',
+    '[out:json][timeout:8];',
     '(',
-    `  relation["water"~"^(reservoir|lake|canal|river)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  relation["water"~"^(reservoir|lake|canal|river|pond|oxbow|basin)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
     `  relation["natural"="water"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
-    `  relation["landuse"="reservoir"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  relation["landuse"~"^(reservoir|basin)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
     `  relation["waterway"~"^(river|canal)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
     `  way["natural"="water"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
-    `  way["waterway"~"^(river|canal|dam|weir)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  way["landuse"~"^(reservoir|basin)$"](around:${localRadiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  way["leisure"="fishing"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  node["leisure"="fishing"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  way["waterway"="riverbank"](around:${localRadiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  way["waterway"~"^(river|canal|stream|dam|weir)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  node["waterway"~"^(dam|weir)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
     ...(majorOnly
       ? []
       : [
           `  way["natural"="water"](around:${localRadiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
           `  way["waterway"~"^(dam|weir)$"](around:${localRadiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+          `  node["waterway"~"^(dam|weir)$"](around:${localRadiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
         ]),
     ');',
-    'out tags center bb 80;',
+    'out tags geom 90;',
   ];
   const body = `data=${encodeURIComponent(qlLines.join('\n'))}`;
   const endpoints = [
     'https://overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
   ];
 
   for (const endpoint of endpoints) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3200);
+    const timer = setTimeout(() => controller.abort(), 5000);
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -1889,37 +1963,38 @@ export async function discoverOsmWaterBodies(params: {
   // Overpass hits enriched with Nominatim multipolygons/linestrings
   for (const el of overpassElements) {
     const isDamOrWeir = el.tags?.waterway === 'dam' || el.tags?.waterway === 'weir';
+    const isFishingSpot = el.tags?.leisure === 'fishing';
     let rawName = el.tags?.name?.trim() || '';
+    const elCenterLat =
+      el.lat ?? el.center?.lat ?? (el.bounds ? (el.bounds.minlat + el.bounds.maxlat) / 2 : undefined);
+    const elCenterLng =
+      el.lon ?? el.center?.lon ?? (el.bounds ? (el.bounds.minlon + el.bounds.maxlon) / 2 : undefined);
     if (!rawName) {
       if (majorOnly) continue;
-      // Include unnamed local lakes, ponds, and dams when discovering nearby water bodies
-      const cLatTmp = el.center?.lat ?? (el.bounds ? (el.bounds.minlat + el.bounds.maxlat) / 2 : undefined);
-      const cLngTmp = el.center?.lon ?? (el.bounds ? (el.bounds.minlon + el.bounds.maxlon) / 2 : undefined);
-      if (typeof cLatTmp !== 'number' || typeof cLngTmp !== 'number') continue;
+      // Include unnamed local lakes, ponds, fishing spots, and dams when discovering nearby water bodies
+      if (typeof elCenterLat !== 'number' || typeof elCenterLng !== 'number') continue;
       if (isDamOrWeir) {
-        rawName = `Плотина (${cLatTmp.toFixed(3)}, ${cLngTmp.toFixed(3)})`;
+        rawName = `Плотина (${elCenterLat.toFixed(3)}, ${elCenterLng.toFixed(3)})`;
+      } else if (isFishingSpot) {
+        rawName = `Рыболовный пруд (${elCenterLat.toFixed(3)}, ${elCenterLng.toFixed(3)})`;
       } else if (el.bounds) {
         const dLatKm = Math.abs(el.bounds.maxlat - el.bounds.minlat) * 111;
-        const dLngKm = Math.abs(el.bounds.maxlon - el.bounds.minlon) * 111 * Math.cos((cLatTmp * Math.PI) / 180);
+        const dLngKm = Math.abs(el.bounds.maxlon - el.bounds.minlon) * 111 * Math.cos((elCenterLat * Math.PI) / 180);
         const estHa = dLatKm * dLngKm * 38;
-        if (estHa < 0.8) continue;
+        if (estHa < 0.35) continue;
         const kindLabel = el.tags?.water === 'pond' ? 'Пруд' : el.tags?.water === 'reservoir' ? 'Водоём / плотина' : 'Озеро / пруд';
-        rawName = `${kindLabel} (${cLatTmp.toFixed(3)}, ${cLngTmp.toFixed(3)})`;
+        rawName = `${kindLabel} (${elCenterLat.toFixed(3)}, ${elCenterLng.toFixed(3)})`;
       } else {
         continue;
       }
     }
-    const prefix = el.type === 'relation' ? 'R' : 'W';
+    const prefix = el.type === 'relation' ? 'R' : el.type === 'node' ? 'N' : 'W';
     const osmTagKey = `${prefix}${el.id}`;
     const type = inferWaterBodyTypeFromOsm(el.tags ?? {}, rawName);
-    const nomItem = nomMap.get(osmTagKey);
+    const nomItem = el.type === 'node' ? undefined : nomMap.get(osmTagKey);
 
-    let centerLat = el.center?.lat;
-    let centerLng = el.center?.lon;
-    if ((typeof centerLat !== 'number' || typeof centerLng !== 'number') && el.bounds) {
-      centerLat = (el.bounds.minlat + el.bounds.maxlat) / 2;
-      centerLng = (el.bounds.minlon + el.bounds.maxlon) / 2;
-    }
+    const centerLat = elCenterLat;
+    const centerLng = elCenterLng;
     if (typeof centerLat !== 'number' || typeof centerLng !== 'number') continue;
 
     let extentKm = 0;
@@ -1951,22 +2026,129 @@ export async function discoverOsmWaterBodies(params: {
 
     let polygon: [number, number][];
     let polygonRings: [number, number][][] | undefined;
+    let polygonParts: [number, number][][][] | undefined;
+    let riverLines: [number, number][][] | undefined;
+    let geometryQuality: WaterBody['geometry_quality'] = 'approximate';
+    let exactAreaHa: number | undefined = extracted?.areaHa;
     let interiorCenter: LatLng = extracted?.center ?? {
       lat: Number(centerLat.toFixed(5)),
       lng: Number(centerLng.toFixed(5)),
     };
 
+    const isAreaWaterTag =
+      el.tags?.natural === 'water' ||
+      el.tags?.landuse === 'reservoir' ||
+      el.tags?.waterway === 'riverbank' ||
+      Boolean(el.tags?.water);
+
     if (extracted) {
       polygon = extracted.polygon;
       polygonRings = extracted.polygon_rings;
-    } else if (el.geometry && el.geometry.length >= 2) {
-      if (type === 'river') {
-        const buf = buildPolygonFromLineNodes(el.geometry, majorWaterway ? 42 : 14);
-        polygon = buf.polygon;
-        interiorCenter = buf.center;
+      polygonParts = extracted.polygon_parts;
+      riverLines = extracted.river_lines;
+      geometryQuality = extracted.geometry_quality;
+    } else if (el.type === 'relation' && Array.isArray(el.members) && el.members.length > 0) {
+      const outerWays: [number, number][][] = [];
+      const innerWays: [number, number][][] = [];
+      const linearWays: [number, number][][] = [];
+      for (const m of el.members) {
+        if (!Array.isArray(m.geometry) || m.geometry.length < 2) continue;
+        const pts = m.geometry.map((p) => [p.lon, p.lat] as [number, number]);
+        if (m.role === 'inner') innerWays.push(pts);
+        else if (m.role === 'outer' || isAreaWaterTag) outerWays.push(pts);
+        else linearWays.push(pts);
+      }
+      const stitchedOuter = stitchOsmRelationWays(outerWays);
+      const stitchedInner = stitchOsmRelationWays(innerWays);
+      const parts = groupOuterAndInnerRings(stitchedOuter, stitchedInner);
+
+      if (parts.length > 0) {
+        polygon = parts[0][0];
+        if (parts[0].length > 1) polygonRings = parts[0];
+        if (parts.length > 1) polygonParts = parts;
+        geometryQuality = 'exact';
+        interiorCenter = findInteriorWaterPoint(parts[0], interiorCenter);
+        exactAreaHa = Math.max(
+          0.3,
+          Number(
+            parts
+              .reduce(
+                (sum, p) =>
+                  sum +
+                  Math.max(
+                    0.1,
+                    computePolygonAreaHa(p[0]) -
+                      p.slice(1).reduce((hSum, h) => hSum + computePolygonAreaHa(h), 0)
+                  ),
+                0
+              )
+              .toFixed(1)
+          )
+        );
+      } else if (linearWays.length > 0 && type === 'river') {
+        const simplifiedLines = linearWays
+          .map((l) => simplifyPolylineRDP(l, 0.00006))
+          .filter((l) => l.length >= 2)
+          .slice(0, 12);
+        const primary = simplifiedLines[0];
+        if (primary) {
+          const buf = buildPolygonFromLineNodes(
+            primary.map(([lon, lat]) => ({ lat, lon })),
+            majorWaterway ? 36 : 14
+          );
+          polygon = buf.polygon;
+          riverLines = simplifiedLines;
+          geometryQuality = 'centerline';
+          interiorCenter = buf.center;
+        } else {
+          polygon = buildWaterBodyFromGeocodeFeature({
+            id: `wb-osm-${osmTagKey}`,
+            title: rawName,
+            lat: centerLat,
+            lng: centerLng,
+            type,
+          }).polygon;
+          geometryQuality = 'approximate';
+        }
       } else {
+        polygon = buildWaterBodyFromGeocodeFeature({
+          id: `wb-osm-${osmTagKey}`,
+          title: rawName,
+          lat: centerLat,
+          lng: centerLng,
+          type,
+        }).polygon;
+        geometryQuality = 'approximate';
+      }
+    } else if (el.geometry && el.geometry.length >= 2) {
+      const firstPt = el.geometry[0];
+      const lastPt = el.geometry[el.geometry.length - 1];
+      const isClosedWay =
+        el.geometry.length >= 4 &&
+        Math.abs(firstPt.lat - lastPt.lat) < 0.0002 &&
+        Math.abs(firstPt.lon - lastPt.lon) < 0.0002;
+
+      if (type === 'river' && !isClosedWay && !isAreaWaterTag) {
+        const buf = buildPolygonFromLineNodes(el.geometry, majorWaterway ? 36 : 14);
+        polygon = buf.polygon;
+        riverLines = [buf.line];
+        geometryQuality = 'centerline';
+        interiorCenter = buf.center;
+      } else if (isClosedWay || isAreaWaterTag) {
         polygon = buildClosedPolygonFromNodes(el.geometry);
+        geometryQuality = isSyntheticPlaceholderPolygon(polygon) ? 'approximate' : 'exact';
         interiorCenter = findInteriorWaterPoint([polygon], interiorCenter);
+        exactAreaHa = computePolygonAreaHa(polygon);
+      } else {
+        // Linear dam/weir or open way -> approximate point marker (never fill dry land!)
+        polygon = buildWaterBodyFromGeocodeFeature({
+          id: `wb-osm-${osmTagKey}`,
+          title: rawName,
+          lat: centerLat,
+          lng: centerLng,
+          type,
+        }).polygon;
+        geometryQuality = 'approximate';
       }
     } else {
       polygon = buildWaterBodyFromGeocodeFeature({
@@ -1976,12 +2158,13 @@ export async function discoverOsmWaterBodies(params: {
         lng: centerLng,
         type,
       }).polygon;
+      geometryQuality = 'approximate';
     }
 
     const finalMajor =
       majorWaterway ||
-      (type === 'river' && ((extracted?.lengthKm ?? 0) >= 95 || (extracted?.areaHa ?? 0) >= 160));
-    const defaults = defaultDepthForType(type, extracted?.areaHa ?? bboxApproxHa, {
+      (type === 'river' && ((extracted?.lengthKm ?? 0) >= 95 || (exactAreaHa ?? 0) >= 160));
+    const defaults = defaultDepthForType(type, exactAreaHa ?? bboxApproxHa, {
       isCanalOrMajorRiver: finalMajor,
       isStream,
     });
@@ -1995,9 +2178,12 @@ export async function discoverOsmWaterBodies(params: {
       center: interiorCenter,
       polygon,
       ...(polygonRings ? { polygon_rings: polygonRings } : {}),
+      ...(polygonParts ? { polygon_parts: polygonParts } : {}),
+      ...(riverLines ? { river_lines: riverLines } : {}),
+      geometry_quality: geometryQuality,
       area_ha: Math.round(defaults.area * 10) / 10,
       source: 'osm',
-      confidence: extracted ? 0.94 : 0.86,
+      confidence: geometryQuality === 'exact' ? 0.95 : geometryQuality === 'centerline' ? 0.91 : 0.84,
       moderation_status: 'verified',
       connected_to: null,
       has_bathymetry: false,

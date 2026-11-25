@@ -1,8 +1,57 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Bell, ChevronDown, ChevronRight, Fish, LocateFixed, Star, TrendingUp, X } from 'lucide-react';
-import { waterBodyTypeRu } from '../lib/fishLogic';
+import { buildMoonPhaseFishingAdvice, waterBodyTypeRu } from '../lib/fishLogic';
 import { REGIONS_CATALOG, getRegionById } from '../lib/regions';
-import type { FishSpecies, GoodBiteWaterBodyItem, WaterBody } from '../lib/types';
+import type { FishSpecies, GoodBiteWaterBodyItem, WaterBody, WeatherSnapshot } from '../lib/types';
+
+function MiniMoonPhaseDisc({
+  illumination,
+  isWaning,
+  phaseLabel,
+}: {
+  illumination: number;
+  isWaning: boolean;
+  phaseLabel: string;
+}) {
+  const clamped = Math.max(0, Math.min(100, illumination));
+  const frac = clamped / 100;
+  const r = 10;
+  const cx = 12;
+  const cy = 12;
+
+  let litPath: string | null = null;
+  if (clamped < 98 && clamped > 2) {
+    const rx = Math.max(0.2, Math.abs(1 - 2 * frac) * r);
+    const topY = cy - r;
+    const botY = cy + r;
+    if (!isWaning) {
+      const termSweep = frac >= 0.5 ? 1 : 0;
+      litPath = `M ${cx} ${topY} A ${r} ${r} 0 0 1 ${cx} ${botY} A ${rx.toFixed(2)} ${r} 0 0 ${termSweep} ${cx} ${topY} Z`;
+    } else {
+      const termSweep = frac >= 0.5 ? 0 : 1;
+      litPath = `M ${cx} ${topY} A ${r} ${r} 0 0 0 ${cx} ${botY} A ${rx.toFixed(2)} ${r} 0 0 ${termSweep} ${cx} ${topY} Z`;
+    }
+  }
+
+  return (
+    <svg
+      width={24}
+      height={24}
+      viewBox="0 0 24 24"
+      role="img"
+      aria-label={`Фаза Луны: ${phaseLabel}, освещённость ${clamped}%`}
+      className="mt-0.5 shrink-0"
+    >
+      <circle cx={cx} cy={cy} r={r} className="fill-slate-800 dark:fill-slate-950" />
+      {clamped >= 98 ? (
+        <circle cx={cx} cy={cy} r={r} className="fill-amber-200" />
+      ) : litPath ? (
+        <path d={litPath} className="fill-amber-200" />
+      ) : null}
+      <circle cx={cx} cy={cy} r={r} fill="none" strokeWidth="1.1" className="stroke-slate-300 dark:stroke-slate-600" />
+    </svg>
+  );
+}
 
 interface GoodBiteWidgetProps {
   items: GoodBiteWaterBodyItem[];
@@ -29,6 +78,7 @@ interface GoodBiteWidgetProps {
   onChangeRegionId?: (regionId: string) => void;
   majorOnly?: boolean;
   onToggleMajorOnly?: (v: boolean) => void;
+  weather?: WeatherSnapshot | null;
 }
 
 const WidgetCardContent: React.FC<{
@@ -53,6 +103,7 @@ const WidgetCardContent: React.FC<{
   onChangeRegionId?: (regionId: string) => void;
   majorOnly: boolean;
   onToggleMajorOnly?: (v: boolean) => void;
+  weather?: WeatherSnapshot | null;
 }> = ({
   items,
   totalInRadius,
@@ -75,9 +126,18 @@ const WidgetCardContent: React.FC<{
   onChangeRegionId,
   majorOnly,
   onToggleMajorOnly,
+  weather = null,
 }) => {
   const favSet = new Set(favoriteIds);
   const activeRegion = selectedRegionId !== 'all' ? getRegionById(selectedRegionId) : null;
+  const selectedSpeciesObj = useMemo(
+    () => (selectedSpeciesId !== 'all' ? speciesList.find((s) => s.id === selectedSpeciesId) ?? null : null),
+    [speciesList, selectedSpeciesId]
+  );
+  const moonAdvice = useMemo(
+    () => buildMoonPhaseFishingAdvice(weather, selectedSpeciesObj),
+    [weather, selectedSpeciesObj]
+  );
 
   return (
     <section
@@ -222,6 +282,47 @@ const WidgetCardContent: React.FC<{
         )}
       </div>
 
+      {/* Moon Phase & Illumination Fishing Tip (from weather_snapshot) */}
+      {moonAdvice && (
+        <div
+          data-testid="good-bite-moon-advice"
+          className="flex items-start gap-2.5 border-b border-slate-100 bg-slate-50/85 px-3.5 py-2 dark:border-slate-800 dark:bg-slate-800/50"
+        >
+          <MiniMoonPhaseDisc
+            illumination={moonAdvice.illuminationPct}
+            isWaning={moonAdvice.isWaning}
+            phaseLabel={moonAdvice.phaseLabel}
+          />
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 text-[11px]">
+              <span className="font-semibold text-slate-900 dark:text-slate-100">
+                {moonAdvice.phaseLabel}
+                <span className="font-mono font-normal text-slate-500 dark:text-slate-400 tabular-nums">
+                  {' '}· {moonAdvice.illuminationPct}%
+                </span>
+              </span>
+              <span
+                className={`text-[10px] font-semibold ${
+                  moonAdvice.tone === 'favorable'
+                    ? 'text-teal-700 dark:text-teal-400'
+                    : moonAdvice.tone === 'caution'
+                      ? 'text-amber-700 dark:text-amber-400'
+                      : 'text-slate-600 dark:text-slate-300'
+                }`}
+              >
+                {moonAdvice.impactLabel}
+              </span>
+            </div>
+            <p className="mt-0.5 text-[10.5px] leading-snug text-slate-600 dark:text-slate-300">
+              {moonAdvice.behaviorSummary}
+            </p>
+            <p className="mt-0.5 text-[10.5px] font-medium leading-snug text-slate-800 dark:text-slate-200">
+              Совет: {moonAdvice.tacticalTip}
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Water Bodies List */}
       <div className="max-h-[196px] divide-y divide-slate-100 overflow-y-auto dark:divide-slate-800">
         {items.length > 0 ? (
@@ -322,6 +423,7 @@ export const GoodBiteWidget: React.FC<GoodBiteWidgetProps> = ({
   onChangeRegionId,
   majorOnly = false,
   onToggleMajorOnly,
+  weather = null,
 }) => {
   return (
     <>
@@ -351,6 +453,7 @@ export const GoodBiteWidget: React.FC<GoodBiteWidgetProps> = ({
               onChangeRegionId={onChangeRegionId}
               majorOnly={majorOnly}
               onToggleMajorOnly={onToggleMajorOnly}
+              weather={weather}
             />
           </div>
         ) : (
@@ -424,6 +527,7 @@ export const GoodBiteWidget: React.FC<GoodBiteWidgetProps> = ({
               onChangeRegionId={onChangeRegionId}
               majorOnly={majorOnly}
               onToggleMajorOnly={onToggleMajorOnly}
+              weather={weather}
             />
           </div>
         </div>

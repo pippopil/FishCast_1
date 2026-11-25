@@ -3,6 +3,7 @@ import type {
   BiteForecastResponse,
   CatchReport,
   FishSpecies,
+  GpxRouteTrack,
   KnotGuide,
   SyncQueueItem,
   WaterBody,
@@ -47,6 +48,7 @@ export interface OfflineStorageStats {
   mapTilesCount: number;
   mapTilesBytes: number;
   offlineRegionsCount: number;
+  gpxTracksCount: number;
   referencesUpdatedAt: string | null;
   waterBodiesUpdatedAt: string | null;
 }
@@ -130,9 +132,24 @@ async function kvGet<T>(key: string): Promise<T | null> {
   }
 }
 
+export function mergeSpeciesCatalog(primary: FishSpecies[], fallback: FishSpecies[]): FishSpecies[] {
+  const byId = new Map<string, FishSpecies>();
+  for (const sp of primary) {
+    if (sp && sp.id) byId.set(sp.id, sp);
+  }
+  for (const sp of fallback) {
+    if (sp && sp.id && !byId.has(sp.id)) {
+      byId.set(sp.id, sp);
+    }
+  }
+  return Array.from(byId.values());
+}
+
 export const offlineDb = {
   async saveWaterBodies(items: WaterBody[]): Promise<void> {
-    await kvSet('water_bodies', items);
+    // Google Maps Platform ToS compliance: do not permanently persist Google Places POIs in IndexedDB
+    const persistable = items.filter((wb) => wb.source !== 'google_places');
+    await kvSet('water_bodies', persistable);
     await kvSet('water_bodies_updated_at', new Date().toISOString());
   },
   async getWaterBodies(): Promise<WaterBody[]> {
@@ -279,22 +296,37 @@ export const offlineDb = {
     const { species: cached, meta } = await this.getSpeciesCache();
     const cachedAtMs = meta?.cached_at ? Date.parse(meta.cached_at) : NaN;
     const isExpired = !Number.isFinite(cachedAtMs) || Date.now() - cachedAtMs > staleAfterMs;
-    const isStale = cached.length === 0 || meta?.source === 'seed' || isExpired || forceRevalidate;
+    const cachedIds = new Set(cached.map((s) => s.id));
+    const missingFromCache = fallback.some((s) => !cachedIds.has(s.id));
+    const isStale =
+      cached.length === 0 ||
+      missingFromCache ||
+      meta?.source === 'seed' ||
+      isExpired ||
+      forceRevalidate;
 
     if (cached.length > 0) {
+      const effectiveSpecies = missingFromCache ? mergeSpeciesCatalog(cached, fallback) : cached;
+      let effectiveMeta = meta;
+      if (missingFromCache) {
+        effectiveMeta = await this.saveSpeciesCache(effectiveSpecies, 'seed');
+      }
       if (isOnline && isStale) {
-        void this.revalidateSpeciesCache(fetcher).then((res) => {
+        void this.revalidateSpeciesCache(async () => {
+          const remote = await fetcher();
+          return mergeSpeciesCatalog(remote, fallback);
+        }).then((res) => {
           if (res) {
             onRevalidated?.(res.species, res.meta);
           }
         });
       }
       return {
-        species: cached,
-        source: 'cache',
+        species: effectiveSpecies,
+        source: missingFromCache ? 'fallback' : 'cache',
         isStale,
         revalidated: false,
-        meta,
+        meta: effectiveMeta,
       };
     }
 
@@ -437,6 +469,13 @@ export const offlineDb = {
     return (await kvGet<import('../lib/types').OfflineMapRegion[]>('offline_map_regions')) ?? [];
   },
 
+  async saveGpxTracks(tracks: GpxRouteTrack[]): Promise<void> {
+    await kvSet('gpx_route_tracks', tracks);
+  },
+  async getGpxTracks(): Promise<GpxRouteTrack[]> {
+    return (await kvGet<GpxRouteTrack[]>('gpx_route_tracks')) ?? [];
+  },
+
   async putMapTile(tile: StoredMapTile): Promise<void> {
     try {
       const db = await openDb();
@@ -532,6 +571,11 @@ export const offlineDb = {
               key === 'water_bodies' ||
               key === 'reports_cache' ||
               key === 'last_water_body' ||
+              key === 'species' ||
+              key === 'species_cache_meta' ||
+              key === 'knots' ||
+              key === 'knots_cache_meta' ||
+              key === 'references_updated_at' ||
               key.startsWith('wb_bundle_')
             ) {
               cursor.delete();
@@ -560,6 +604,7 @@ export const offlineDb = {
       mapTilesCount: 0,
       mapTilesBytes: 0,
       offlineRegionsCount: 0,
+      gpxTracksCount: 0,
       referencesUpdatedAt: null,
       waterBodiesUpdatedAt: null,
     };
@@ -599,6 +644,7 @@ export const offlineDb = {
         knotsKvCount: number;
         reportsCount: number;
         offlineRegionsCount: number;
+        gpxTracksCount: number;
         referencesUpdatedAt: string | null;
         waterBodiesUpdatedAt: string | null;
       }>((resolve, reject) => {
@@ -610,6 +656,7 @@ export const offlineDb = {
         let knotsKvCount = 0;
         let reportsCount = 0;
         let offlineRegionsCount = 0;
+        let gpxTracksCount = 0;
         let referencesUpdatedAt: string | null = null;
         let knotsCachedAt: string | null = null;
         let waterBodiesUpdatedAt: string | null = null;
@@ -625,6 +672,7 @@ export const offlineDb = {
             else if (key === 'knots' && Array.isArray(val)) knotsKvCount = val.length;
             else if (key === 'reports_cache' && Array.isArray(val)) reportsCount = val.length;
             else if (key === 'offline_map_regions' && Array.isArray(val)) offlineRegionsCount = val.length;
+            else if (key === 'gpx_route_tracks' && Array.isArray(val)) gpxTracksCount = val.length;
             else if (key === 'references_updated_at' && typeof val === 'string') referencesUpdatedAt = val;
             else if (key === 'knots_cache_meta' && val && typeof (val as KnotsCacheMeta).cached_at === 'string') {
               knotsCachedAt = (val as KnotsCacheMeta).cached_at;
@@ -640,6 +688,7 @@ export const offlineDb = {
               knotsKvCount,
               reportsCount,
               offlineRegionsCount,
+              gpxTracksCount,
               referencesUpdatedAt: referencesUpdatedAt ?? knotsCachedAt,
               waterBodiesUpdatedAt,
             });
@@ -686,6 +735,7 @@ export const offlineDb = {
         mapTilesCount: tileStats.count,
         mapTilesBytes: tileStats.totalBytes,
         offlineRegionsCount: kvStats.offlineRegionsCount,
+        gpxTracksCount: kvStats.gpxTracksCount,
         referencesUpdatedAt: kvStats.referencesUpdatedAt,
         waterBodiesUpdatedAt: kvStats.waterBodiesUpdatedAt,
       };

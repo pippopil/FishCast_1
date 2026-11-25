@@ -59,11 +59,12 @@ export default defineConfig(() => {
               },
             },
             {
-              urlPattern: /\/api\/v1\/(species|recommendations).*/i,
-              handler: 'CacheFirst',
+              urlPattern: /\/api\/v1\/(species|recommendations|knots).*/i,
+              handler: 'NetworkFirst',
               options: {
-                cacheName: 'fishcast-reference-cache',
-                expiration: { maxEntries: 60, maxAgeSeconds: 60 * 60 * 24 * 14 },
+                cacheName: 'fishcast-reference-cache-v2',
+                networkTimeoutSeconds: 4,
+                expiration: { maxEntries: 60, maxAgeSeconds: 60 * 60 * 24 * 7 },
                 cacheableResponse: { statuses: [0, 200] },
               },
             },

@@ -1,6 +1,13 @@
-import React, { useState } from 'react';
-import { Car, Compass, Fish, Footprints, Globe, Loader2, MapPin, Plus, Search, Star, TrendingUp } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { Calendar, Car, Compass, Fish, Footprints, Globe, Loader2, MapPin, Plus, Search, Star, TrendingUp } from 'lucide-react';
 import { getExpectedFishForWaterBody, waterBodyTypeRu } from '../lib/fishLogic';
+import {
+  MONTHS_RU_FULL,
+  MONTHS_RU_PREP,
+  MONTHS_RU_SHORT,
+  rankFishForWaterBodyInMonth,
+  type WaterBodyMonthlyFishEntry,
+} from '../lib/seasonalFishing';
 import { assessCrayfishPresence } from '../data/crayfishData';
 import { REGIONS_CATALOG, getRegionById } from '../lib/regions';
 import type {
@@ -75,30 +82,73 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
   const [newArea, setNewArea] = useState('0.6');
   const [formError, setFormError] = useState<string | null>(null);
   const [onlyGoodBite, setOnlyGoodBite] = useState(false);
+  const currentMonth = new Date().getMonth() + 1;
+  const [selectedMonth, setSelectedMonth] = useState<number>(currentMonth);
+  const [sortMode, setSortMode] = useState<'probability' | 'distance'>('probability');
 
-  const filtered = nearbyItems.filter((item) => {
-    if (onlyGoodBite) {
-      const bite = goodBiteById[item.water_body.id];
-      if (!bite || bite.f_index < 66) return false;
-    }
-    const q = query.trim().toLowerCase();
-    if (!q) return true;
-    const fishMatches =
-      speciesList.length > 0 &&
-      getExpectedFishForWaterBody({ waterBody: item.water_body, speciesList, reports }).some((f) =>
-        f.species_name.toLowerCase().includes(q)
+  const selectedMonthFull = MONTHS_RU_FULL[selectedMonth - 1] ?? 'Январь';
+  const selectedMonthPrep = MONTHS_RU_PREP[selectedMonth - 1] ?? 'январе';
+
+  const monthlyFishByWbId = useMemo(() => {
+    const map = new Map<string, WaterBodyMonthlyFishEntry[]>();
+    if (speciesList.length === 0) return map;
+    for (const item of nearbyItems) {
+      map.set(
+        item.water_body.id,
+        rankFishForWaterBodyInMonth({
+          waterBody: item.water_body,
+          speciesList,
+          reports,
+          month: selectedMonth,
+        })
       );
-    const crayfishMatches =
-      (q.includes('рак') || q.includes('crayfish')) &&
-      assessCrayfishPresence(item.water_body).level !== 'low';
-    return (
-      item.water_body.display_label.toLowerCase().includes(q) ||
-      waterBodyTypeRu(item.water_body.type).toLowerCase().includes(q) ||
-      item.water_body.region.toLowerCase().includes(q) ||
-      fishMatches ||
-      crayfishMatches
-    );
-  });
+    }
+    return map;
+  }, [nearbyItems, speciesList, reports, selectedMonth]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const matched = nearbyItems.filter((item) => {
+      if (onlyGoodBite) {
+        const bite = goodBiteById[item.water_body.id];
+        if (!bite || bite.f_index < 66) return false;
+      }
+      if (!q) return true;
+      const monthlyFish = monthlyFishByWbId.get(item.water_body.id);
+      const fishMatches =
+        speciesList.length > 0 &&
+        (monthlyFish
+          ? monthlyFish.some((f) => f.species.name.toLowerCase().includes(q))
+          : getExpectedFishForWaterBody({ waterBody: item.water_body, speciesList, reports }).some((f) =>
+              f.species_name.toLowerCase().includes(q)
+            ));
+      const crayfishMatches =
+        (q.includes('рак') || q.includes('crayfish')) &&
+        assessCrayfishPresence(item.water_body).level !== 'low';
+      return (
+        item.water_body.display_label.toLowerCase().includes(q) ||
+        waterBodyTypeRu(item.water_body.type).toLowerCase().includes(q) ||
+        item.water_body.region.toLowerCase().includes(q) ||
+        fishMatches ||
+        crayfishMatches
+      );
+    });
+
+    if (sortMode === 'probability' && speciesList.length > 0) {
+      return [...matched].sort((a, b) => {
+        const fishA = monthlyFishByWbId.get(a.water_body.id) ?? [];
+        const fishB = monthlyFishByWbId.get(b.water_body.id) ?? [];
+        const matchA = q ? fishA.find((f) => f.species.name.toLowerCase().includes(q)) : fishA[0];
+        const matchB = q ? fishB.find((f) => f.species.name.toLowerCase().includes(q)) : fishB[0];
+        const probA = matchA?.probability ?? fishA[0]?.probability ?? 0;
+        const probB = matchB?.probability ?? fishB[0]?.probability ?? 0;
+        if (probB !== probA) return probB - probA;
+        return a.straight_distance_m - b.straight_distance_m;
+      });
+    }
+
+    return [...matched].sort((a, b) => a.straight_distance_m - b.straight_distance_m);
+  }, [nearbyItems, onlyGoodBite, goodBiteById, query, speciesList, reports, monthlyFishByWbId, sortMode]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -409,6 +459,82 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
             </label>
           </div>
         </div>
+
+        {/* 12-Month Catch Probability Filter & Sort Mode */}
+        {speciesList.length > 0 && (
+          <div
+            data-testid="directory-month-filter"
+            className="border-t border-slate-100 pt-3 space-y-2.5 dark:border-slate-800"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-800 dark:text-slate-200">
+                <Calendar className="h-3.5 w-3.5 text-sky-700 dark:text-sky-400" aria-hidden="true" />
+                <span>
+                  Клёв по месяцам: <span className="text-sky-700 dark:text-sky-400">{selectedMonthFull}</span>
+                </span>
+                {selectedMonth !== currentMonth && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedMonth(currentMonth)}
+                    className="text-[11px] font-medium text-sky-700 underline underline-offset-2 hover:text-sky-800 dark:text-sky-400"
+                  >
+                    Текущий месяц
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-0.5 dark:bg-slate-800" role="group" aria-label="Сортировка водоёмов">
+                <button
+                  type="button"
+                  data-testid="directory-sort-probability"
+                  onClick={() => setSortMode('probability')}
+                  className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                    sortMode === 'probability'
+                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-white'
+                      : 'text-slate-600 dark:text-slate-400'
+                  }`}
+                >
+                  По вероятности (убыв.)
+                </button>
+                <button
+                  type="button"
+                  data-testid="directory-sort-distance"
+                  onClick={() => setSortMode('distance')}
+                  className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                    sortMode === 'distance'
+                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-white'
+                      : 'text-slate-600 dark:text-slate-400'
+                  }`}
+                >
+                  По расстоянию
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-6 gap-1 sm:grid-cols-12" role="group" aria-label="Выбор месяца рыбалки">
+              {MONTHS_RU_SHORT.map((label, idx) => {
+                const m = idx + 1;
+                const active = selectedMonth === m;
+                return (
+                  <button
+                    key={label}
+                    type="button"
+                    data-testid={`dir-month-btn-${m}`}
+                    aria-pressed={active}
+                    onClick={() => setSelectedMonth(m)}
+                    className={`min-h-[32px] rounded-lg px-1.5 py-1 text-[11px] font-semibold transition-colors ${
+                      active
+                        ? 'bg-sky-700 text-white shadow-xs'
+                        : 'bg-slate-100 text-slate-700 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Results List */}
@@ -498,18 +624,59 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
                 </p>
 
                 {speciesList.length > 0 && (() => {
-                  const expected = getExpectedFishForWaterBody({ waterBody: wb, speciesList, reports });
-                  if (expected.length === 0) return null;
-                  const topNames = expected.slice(0, 6).map((f) => f.species_name).join(', ');
-                  const extra = expected.length > 6 ? ` +${expected.length - 6}` : '';
+                  const rankedFish = monthlyFishByWbId.get(wb.id) ?? [];
+                  if (rankedFish.length === 0) return null;
+                  const topEntries = rankedFish.slice(0, 6);
+                  const extra = rankedFish.length > 6 ? ` +${rankedFish.length - 6}` : '';
+                  const topProb = topEntries[0]?.probability ?? 0;
                   return (
-                    <p className="mt-1.5 flex items-start gap-1.5 text-xs text-slate-600 dark:text-slate-300">
-                      <Fish className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sky-700 dark:text-sky-400" aria-hidden="true" />
-                      <span>
-                        <span className="font-semibold text-slate-700 dark:text-slate-200">Рыба:</span> {topNames}
-                        {extra}
-                      </span>
-                    </p>
+                    <div className="mt-2 space-y-1">
+                      <div className="flex items-center justify-between gap-2 text-[11px]">
+                        <span className="inline-flex items-center gap-1.5 font-semibold text-slate-700 dark:text-slate-200">
+                          <Fish className="h-3.5 w-3.5 shrink-0 text-sky-700 dark:text-sky-400" aria-hidden="true" />
+                          Кто клюёт в {selectedMonthPrep} (по убыванию вероятности):
+                        </span>
+                        <span
+                          className={`shrink-0 font-mono font-bold tabular-nums ${
+                            topProb >= 68
+                              ? 'text-teal-700 dark:text-teal-400'
+                              : topProb >= 42
+                                ? 'text-sky-700 dark:text-sky-400'
+                                : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                        >
+                          до {topProb}%
+                        </span>
+                      </div>
+                      <p className="text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                        {topEntries.map((entry, idx) => (
+                          <React.Fragment key={entry.species.id}>
+                            {idx > 0 && <span className="text-slate-400" aria-hidden="true"> · </span>}
+                            <span
+                              className={
+                                entry.tier === 'high'
+                                  ? 'font-semibold text-slate-900 dark:text-slate-100'
+                                  : ''
+                              }
+                            >
+                              {entry.species.name}{' '}
+                              <span
+                                className={`font-mono text-[11px] tabular-nums ${
+                                  entry.tier === 'high'
+                                    ? 'font-bold text-teal-700 dark:text-teal-400'
+                                    : entry.tier === 'medium'
+                                      ? 'font-semibold text-sky-700 dark:text-sky-400'
+                                      : 'text-slate-500 dark:text-slate-400'
+                                }`}
+                              >
+                                {entry.probability}%
+                              </span>
+                            </span>
+                          </React.Fragment>
+                        ))}
+                        {extra && <span className="text-slate-400">{extra}</span>}
+                      </p>
+                    </div>
                   );
                 })()}
 

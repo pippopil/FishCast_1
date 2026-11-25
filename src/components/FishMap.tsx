@@ -18,6 +18,8 @@ import {
 } from 'lucide-react';
 import { generateBathymetryContours, haversineMeters } from '../lib/fishLogic';
 import { buildCatchActivityHeatmapGeoJson } from '../lib/catchActivityHeatmap';
+import { buildGpxTracksGeoJson } from '../lib/gpxParser';
+import { buildWaterBodiesMapLayersGeoJson } from '../lib/waterGeometry';
 import {
   bboxToPolygonRing,
   estimateRegionTileCount,
@@ -30,6 +32,7 @@ import { offlineDb } from '../utils/offlineDb';
 import type {
   BathymetryPoint,
   CatchReport,
+  GpxRouteTrack,
   LatLng,
   MapBbox,
   OfflineMapRegion,
@@ -114,6 +117,7 @@ export interface MapLayerToggles {
   contours: boolean;
   heatmap: boolean;
   fishActivityHeatmap: boolean;
+  gpxTracks: boolean;
   prospective: boolean;
   openSeaMap: boolean;
   topoOverlay: boolean;
@@ -130,6 +134,8 @@ interface FishMapProps {
   activeRoute: RouteMultiResult | null;
   layers: MapLayerToggles;
   onToggleLayers: (next: MapLayerToggles) => void;
+  gpxTracks?: GpxRouteTrack[];
+  onToggleGpxTrackVisibility?: (trackId: string) => void;
   historicOverlay?: HistoricMapOverlay | null;
   userOrigin: LatLng;
   onLocateUser?: () => void;
@@ -230,6 +236,8 @@ export const FishMap: React.FC<FishMapProps> = ({
   activeRoute,
   layers,
   onToggleLayers,
+  gpxTracks = [],
+  onToggleGpxTrackVisibility,
   historicOverlay = null,
   userOrigin,
   onLocateUser,
@@ -352,30 +360,15 @@ export const FishMap: React.FC<FishMapProps> = ({
     return { type: 'FeatureCollection' as const, features };
   }, [offlineRegions, showOfflineMenu, activeDownloadTarget]);
 
-  // Build GeoJSON sources memoized
-  const waterGeoJson = useMemo(() => {
-    return {
-      type: 'FeatureCollection' as const,
-      features: waterBodies.map((wb) => ({
-        type: 'Feature' as const,
-        id: wb.id,
-        properties: {
-          id: wb.id,
-          title: wb.display_label,
-          type: wb.type,
-          confidence: wb.confidence,
-          unverified: wb.moderation_status === 'unverified' ? 1 : 0,
-          selected: selectedWaterBody?.id === wb.id ? 1 : 0,
-          has_bathymetry: wb.has_bathymetry ? 1 : 0,
-        },
-        geometry: {
-          type: 'Polygon' as const,
-          coordinates:
-            wb.polygon_rings && wb.polygon_rings.length > 0 ? wb.polygon_rings : [wb.polygon],
-        },
-      })),
-    };
-  }, [waterBodies, selectedWaterBody?.id]);
+  // Build precision water-only GeoJSON sources (real shorelines + river channels + point pins for unresolved contours)
+  const {
+    waterPolygons: waterGeoJson,
+    waterRivers: waterRiversGeoJson,
+    waterMarkers: waterMarkersGeoJson,
+  } = useMemo(
+    () => buildWaterBodiesMapLayersGeoJson(waterBodies, selectedWaterBody?.id ?? null),
+    [waterBodies, selectedWaterBody?.id]
+  );
 
   const activeContours = useMemo(() => {
     const staticContours = selectedWaterBody?.contours ?? [];
@@ -455,6 +448,12 @@ export const FishMap: React.FC<FishMapProps> = ({
   const activeCatchReportsCount = useMemo(
     () => reports.filter((r) => r.visibility !== 'private' && r.outcome !== 'no_bite').length,
     [reports]
+  );
+
+  const gpxTracksGeoJson = useMemo(() => buildGpxTracksGeoJson(gpxTracks), [gpxTracks]);
+  const visibleGpxTracksCount = useMemo(
+    () => gpxTracks.filter((t) => t.visible).length,
+    [gpxTracks]
   );
 
   const routeGeoJson = useMemo(() => {
@@ -543,9 +542,20 @@ export const FishMap: React.FC<FishMapProps> = ({
               '#0284C7',
               ['==', ['get', 'unverified'], 1],
               '#D97706',
-              '#0EA5E9',
+              '#38BDF8',
             ],
-            'fill-opacity': ['case', ['==', ['get', 'selected'], 1], 0.45, 0.28],
+            'fill-opacity': ['case', ['==', ['get', 'selected'], 1], 0.42, 0.2],
+          },
+        });
+        map.addLayer({
+          id: 'water-bodies-selected-halo',
+          type: 'line',
+          source: 'water-bodies',
+          filter: ['==', ['get', 'selected'], 1],
+          paint: {
+            'line-color': '#FFFFFF',
+            'line-width': 5,
+            'line-opacity': 0.85,
           },
         });
         map.addLayer({
@@ -553,8 +563,85 @@ export const FishMap: React.FC<FishMapProps> = ({
           type: 'line',
           source: 'water-bodies',
           paint: {
-            'line-color': ['case', ['==', ['get', 'selected'], 1], '#0369A1', '#0C4A6E'],
-            'line-width': ['case', ['==', ['get', 'selected'], 1], 3, 1.5],
+            'line-color': ['case', ['==', ['get', 'selected'], 1], '#0369A1', '#0284C7'],
+            'line-width': ['case', ['==', ['get', 'selected'], 1], 2.8, 1.3],
+            'line-opacity': ['case', ['==', ['get', 'selected'], 1], 0.98, 0.72],
+          },
+        });
+      }
+
+      if (!map.getSource('water-rivers')) {
+        map.addSource('water-rivers', { type: 'geojson', data: waterRiversGeoJson });
+        map.addLayer({
+          id: 'water-rivers-casing',
+          type: 'line',
+          source: 'water-rivers',
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round',
+          },
+          paint: {
+            'line-color': ['case', ['==', ['get', 'selected'], 1], '#FFFFFF', '#E0F2FE'],
+            'line-width': [
+              'interpolate',
+              ['linear'],
+              ['zoom'],
+              8,
+              ['case', ['==', ['get', 'selected'], 1], 5, 3],
+              13,
+              ['case', ['==', ['get', 'selected'], 1], 10, 6],
+            ],
+            'line-opacity': ['case', ['==', ['get', 'selected'], 1], 0.9, 0.55],
+          },
+        });
+        map.addLayer({
+          id: 'water-rivers-line',
+          type: 'line',
+          source: 'water-rivers',
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round',
+          },
+          paint: {
+            'line-color': ['case', ['==', ['get', 'selected'], 1], '#0369A1', '#0EA5E9'],
+            'line-width': [
+              'interpolate',
+              ['linear'],
+              ['zoom'],
+              8,
+              ['case', ['==', ['get', 'selected'], 1], 3, 1.8],
+              13,
+              ['case', ['==', ['get', 'selected'], 1], 6.5, 3.8],
+            ],
+            'line-opacity': ['case', ['==', ['get', 'selected'], 1], 0.98, 0.85],
+          },
+        });
+      }
+
+      if (!map.getSource('water-markers')) {
+        map.addSource('water-markers', { type: 'geojson', data: waterMarkersGeoJson });
+        map.addLayer({
+          id: 'water-approx-halo',
+          type: 'circle',
+          source: 'water-markers',
+          filter: ['==', ['get', 'selected'], 1],
+          paint: {
+            'circle-color': '#0284C7',
+            'circle-radius': 15,
+            'circle-opacity': 0.22,
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#0369A1',
+          },
+        });
+        map.addLayer({
+          id: 'water-approx-dot',
+          type: 'circle',
+          source: 'water-markers',
+          paint: {
+            'circle-color': ['case', ['==', ['get', 'selected'], 1], '#0369A1', '#0EA5E9'],
+            'circle-radius': ['case', ['==', ['get', 'selected'], 1], 8.5, 6.5],
+            'circle-stroke-width': 2.5,
+            'circle-stroke-color': '#FFFFFF',
           },
         });
       }
@@ -758,24 +845,15 @@ export const FishMap: React.FC<FishMapProps> = ({
       if (!map.getSource('offline-regions')) {
         map.addSource('offline-regions', { type: 'geojson', data: offlineRegionsGeoJson });
         map.addLayer({
-          id: 'offline-regions-downloaded-fill',
-          type: 'fill',
-          source: 'offline-regions',
-          filter: ['==', ['get', 'kind'], 'downloaded'],
-          paint: {
-            'fill-color': '#0D9488',
-            'fill-opacity': 0.09,
-          },
-        });
-        map.addLayer({
           id: 'offline-regions-downloaded',
           type: 'line',
           source: 'offline-regions',
           filter: ['==', ['get', 'kind'], 'downloaded'],
           paint: {
             'line-color': '#0D9488',
-            'line-width': 2,
-            'line-opacity': 0.78,
+            'line-width': 1.75,
+            'line-dasharray': [4, 3],
+            'line-opacity': 0.65,
           },
         });
         map.addLayer({
@@ -797,6 +875,57 @@ export const FishMap: React.FC<FishMapProps> = ({
             'line-color': '#0284C7',
             'line-width': 2.5,
             'line-dasharray': [3, 2],
+          },
+        });
+      }
+
+      if (!map.getSource('gpx-tracks-source')) {
+        map.addSource('gpx-tracks-source', { type: 'geojson', data: gpxTracksGeoJson });
+        map.addLayer({
+          id: 'gpx-tracks-casing',
+          type: 'line',
+          source: 'gpx-tracks-source',
+          filter: ['==', ['get', 'feature_kind'], 'track'],
+          layout: {
+            visibility: layers.gpxTracks ? 'visible' : 'none',
+            'line-cap': 'round',
+            'line-join': 'round',
+          },
+          paint: {
+            'line-color': '#FFFFFF',
+            'line-width': 6,
+            'line-opacity': 0.88,
+          },
+        });
+        map.addLayer({
+          id: 'gpx-tracks-line',
+          type: 'line',
+          source: 'gpx-tracks-source',
+          filter: ['==', ['get', 'feature_kind'], 'track'],
+          layout: {
+            visibility: layers.gpxTracks ? 'visible' : 'none',
+            'line-cap': 'round',
+            'line-join': 'round',
+          },
+          paint: {
+            'line-color': ['coalesce', ['get', 'color'], '#7C3AED'],
+            'line-width': 3.5,
+            'line-opacity': 0.96,
+          },
+        });
+        map.addLayer({
+          id: 'gpx-tracks-endpoints',
+          type: 'circle',
+          source: 'gpx-tracks-source',
+          filter: ['!=', ['get', 'feature_kind'], 'track'],
+          layout: {
+            visibility: layers.gpxTracks ? 'visible' : 'none',
+          },
+          paint: {
+            'circle-color': ['coalesce', ['get', 'color'], '#7C3AED'],
+            'circle-radius': ['match', ['get', 'feature_kind'], 'waypoint', 5.5, 7],
+            'circle-stroke-width': 2.5,
+            'circle-stroke-color': '#FFFFFF',
           },
         });
       }
@@ -832,7 +961,7 @@ export const FishMap: React.FC<FishMapProps> = ({
       initLayers();
     });
 
-    map.on('click', 'water-bodies-fill', (e: maplibregl.MapLayerMouseEvent) => {
+    const handleWaterLayerClick = (e: maplibregl.MapLayerMouseEvent) => {
       if (selectingCustomRef.current) return;
       if (pickDepthRef.current && onPickRef.current) {
         onPickRef.current({ lat: e.lngLat.lat, lng: e.lngLat.lng });
@@ -844,7 +973,20 @@ export const FishMap: React.FC<FishMapProps> = ({
         const found = waterBodiesRef.current.find((w) => w.id === wbId);
         if (found) onSelectRef.current(found);
       }
-    });
+    };
+
+    map.on('click', 'water-bodies-fill', handleWaterLayerClick);
+    map.on('click', 'water-rivers-line', handleWaterLayerClick);
+    map.on('click', 'water-approx-dot', handleWaterLayerClick);
+
+    for (const interactiveLayer of ['water-bodies-fill', 'water-rivers-line', 'water-approx-dot']) {
+      map.on('mouseenter', interactiveLayer, () => {
+        if (!selectingCustomRef.current) map.getCanvas().style.cursor = 'pointer';
+      });
+      map.on('mouseleave', interactiveLayer, () => {
+        if (!selectingCustomRef.current) map.getCanvas().style.cursor = '';
+      });
+    }
 
     map.on('click', 'unclustered-report', (e: maplibregl.MapLayerMouseEvent) => {
       if (selectingCustomRef.current) return;
@@ -873,6 +1015,59 @@ export const FishMap: React.FC<FishMapProps> = ({
           </div>`
         )
         .addTo(map);
+    });
+
+    map.on('click', 'gpx-tracks-line', (e: maplibregl.MapLayerMouseEvent) => {
+      if (selectingCustomRef.current) return;
+      const f = e.features?.[0];
+      if (!f) return;
+      const p = f.properties as {
+        name?: string;
+        distance_label?: string;
+        duration_label?: string;
+        points_count?: number;
+      };
+      const container = document.createElement('div');
+      container.className = 'text-xs text-slate-800';
+      const title = document.createElement('div');
+      title.className = 'font-bold text-slate-900';
+      title.textContent = p.name || 'GPX-маршрут';
+      const meta = document.createElement('div');
+      meta.className = 'mt-1 font-mono text-slate-600';
+      meta.textContent = `${p.distance_label ?? '—'} · ${p.duration_label ?? '—'}`;
+      const sub = document.createElement('div');
+      sub.className = 'mt-0.5 text-[11px] text-slate-500';
+      sub.textContent = `Трек «от дома до лунки» (${p.points_count ?? 0} точек)`;
+      container.append(title, meta, sub);
+      new maplibregl.Popup({ offset: 10 }).setLngLat(e.lngLat).setDOMContent(container).addTo(map);
+    });
+
+    map.on('click', 'gpx-tracks-endpoints', (e: maplibregl.MapLayerMouseEvent) => {
+      if (selectingCustomRef.current) return;
+      const f = e.features?.[0];
+      if (!f || f.geometry.type !== 'Point') return;
+      const coords = f.geometry.coordinates as [number, number];
+      const p = f.properties as {
+        label?: string;
+        track_name?: string;
+        desc?: string;
+      };
+      const container = document.createElement('div');
+      container.className = 'text-xs text-slate-800';
+      const title = document.createElement('div');
+      title.className = 'font-bold text-slate-900';
+      title.textContent = p.label || 'Точка трека';
+      const trackEl = document.createElement('div');
+      trackEl.className = 'mt-0.5 text-slate-600';
+      trackEl.textContent = p.track_name || '';
+      container.append(title, trackEl);
+      if (p.desc) {
+        const descEl = document.createElement('div');
+        descEl.className = 'mt-0.5 text-[11px] text-slate-500';
+        descEl.textContent = p.desc;
+        container.append(descEl);
+      }
+      new maplibregl.Popup({ offset: 12 }).setLngLat(coords).setDOMContent(container).addTo(map);
     });
 
     map.on('click', (e: maplibregl.MapMouseEvent) => {
@@ -907,6 +1102,8 @@ export const FishMap: React.FC<FishMapProps> = ({
     const map = mapRef.current;
     if (!map || !mapReady) return;
     (map.getSource('water-bodies') as maplibregl.GeoJSONSource | undefined)?.setData(waterGeoJson);
+    (map.getSource('water-rivers') as maplibregl.GeoJSONSource | undefined)?.setData(waterRiversGeoJson);
+    (map.getSource('water-markers') as maplibregl.GeoJSONSource | undefined)?.setData(waterMarkersGeoJson);
     (map.getSource('bathymetry-contours') as maplibregl.GeoJSONSource | undefined)?.setData(contoursGeoJson);
     (map.getSource('bathymetry-points') as maplibregl.GeoJSONSource | undefined)?.setData(depthPointsGeoJson);
     (map.getSource('prospective-zones') as maplibregl.GeoJSONSource | undefined)?.setData(zonesGeoJson);
@@ -915,7 +1112,8 @@ export const FishMap: React.FC<FishMapProps> = ({
     (map.getSource('split-route') as maplibregl.GeoJSONSource | undefined)?.setData(routeGeoJson);
     (map.getSource('access-pins') as maplibregl.GeoJSONSource | undefined)?.setData(accessPinGeoJson);
     (map.getSource('offline-regions') as maplibregl.GeoJSONSource | undefined)?.setData(offlineRegionsGeoJson);
-  }, [mapReady, waterGeoJson, contoursGeoJson, depthPointsGeoJson, zonesGeoJson, fishActivityGeoJson, reportsGeoJson, routeGeoJson, accessPinGeoJson, offlineRegionsGeoJson]);
+    (map.getSource('gpx-tracks-source') as maplibregl.GeoJSONSource | undefined)?.setData(gpxTracksGeoJson);
+  }, [mapReady, waterGeoJson, waterRiversGeoJson, waterMarkersGeoJson, contoursGeoJson, depthPointsGeoJson, zonesGeoJson, fishActivityGeoJson, reportsGeoJson, routeGeoJson, accessPinGeoJson, offlineRegionsGeoJson, gpxTracksGeoJson]);
 
   // Layer visibility toggles
   useEffect(() => {
@@ -929,6 +1127,9 @@ export const FishMap: React.FC<FishMapProps> = ({
     setVis('contours-line', layers.contours);
     setVis('bathymetry-heatmap', layers.heatmap);
     setVis('fish-activity-heatmap', layers.fishActivityHeatmap);
+    setVis('gpx-tracks-casing', layers.gpxTracks);
+    setVis('gpx-tracks-line', layers.gpxTracks);
+    setVis('gpx-tracks-endpoints', layers.gpxTracks);
     setVis('prospective-circles', layers.prospective);
     setVis('openseamap-tiles', layers.openSeaMap && isOnline);
     setVis('opentopo-tiles', layers.topoOverlay && isOnline);
@@ -1338,6 +1539,53 @@ export const FishMap: React.FC<FishMapProps> = ({
                   className="h-4 w-4 accent-sky-700"
                 />
               </label>
+
+              <div className="border-t border-slate-100 pt-2 dark:border-slate-800 space-y-1.5">
+                <label
+                  data-testid="toggle-gpx-tracks"
+                  className="flex items-center justify-between gap-2 cursor-pointer"
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-full bg-violet-600" aria-hidden="true" />
+                    <span>GPX-треки (дом → лунка)</span>
+                    <span className="font-mono text-[10px] text-slate-400">
+                      ({visibleGpxTracksCount}/{gpxTracks.length})
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={layers.gpxTracks}
+                    onChange={(e) => onToggleLayers({ ...layers, gpxTracks: e.target.checked })}
+                    className="h-4 w-4 accent-violet-600"
+                  />
+                </label>
+
+                {layers.gpxTracks && gpxTracks.length > 0 && onToggleGpxTrackVisibility && (
+                  <div className="max-h-28 space-y-1 overflow-y-auto pl-4 pr-0.5">
+                    {gpxTracks.map((tr) => (
+                      <label
+                        key={tr.id}
+                        className="flex items-center justify-between gap-2 text-[11px] text-slate-600 cursor-pointer dark:text-slate-300"
+                      >
+                        <span className="inline-flex min-w-0 items-center gap-1.5">
+                          <span
+                            className="h-2 w-2 shrink-0 rounded-full"
+                            style={{ backgroundColor: tr.color }}
+                            aria-hidden="true"
+                          />
+                          <span className="truncate">{tr.name}</span>
+                        </span>
+                        <input
+                          type="checkbox"
+                          checked={tr.visible}
+                          onChange={() => onToggleGpxTrackVisibility(tr.id)}
+                          className="h-3.5 w-3.5 shrink-0 accent-violet-600"
+                        />
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
 
               <div className="border-t border-slate-100 pt-2 dark:border-slate-800 space-y-2">
                 <div className="text-[11px] font-bold text-slate-500 dark:text-slate-400">

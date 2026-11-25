@@ -40,6 +40,7 @@ import { GPSFilter, snapPointToWaterShore } from './geolocation';
 import { parseOsmWaterTags } from '../server/proxies';
 import type {
   BathymetryPoint,
+  BiteForecastSlot,
   CatchReport,
   FishSpecies,
   GoodBiteWaterBodyItem,
@@ -2341,6 +2342,519 @@ test('offlineDb.getSpeciesListSWR performs stale-while-revalidate and falls back
   assert.equal(offlineRes.species.length, SEED_SPECIES.length);
 });
 
+test('parseGpxRouteTrack and buildGpxTracksGeoJson parse home-to-hole GPX tracks, waypoints, metrics, and layer visibility', async () => {
+  const { parseGpxRouteTrack, validateGpxFileMeta, buildGpxTracksGeoJson } = await import('./gpxParser');
+
+  assert.ok(validateGpxFileMeta('photo.jpg', 1024), 'Should reject non-GPX file extension');
+  assert.equal(validateGpxFileMeta('dom-lunka.gpx', 2048), null);
+
+  const sampleGpx = `<?xml version="1.0" encoding="UTF-8"?>
+  <gpx version="1.1" creator="FishCastTest">
+    <wpt lat="51.6625" lon="35.2710">
+      <name>Лунка №1 (яма 5м)</name>
+      <desc>Рабочая бровка</desc>
+    </wpt>
+    <trk>
+      <name>Дом → Сейм (зимняя тропа)</name>
+      <trkseg>
+        <trkpt lat="51.6580" lon="35.2650"><ele>150.0</ele><time>2026-02-10T06:00:00Z</time></trkpt>
+        <trkpt lat="51.6602" lon="35.2680"><ele>154.5</ele><time>2026-02-10T06:08:00Z</time></trkpt>
+        <trkpt lat="51.6625" lon="35.2710"><ele>152.0</ele><time>2026-02-10T06:15:00Z</time></trkpt>
+      </trkseg>
+    </trk>
+  </gpx>`;
+
+  const parsed = parseGpxRouteTrack(sampleGpx, { fileName: 'seym-winter.gpx', colorIndex: 0 });
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+
+  const { track } = parsed;
+  assert.equal(track.name, 'Дом → Сейм (зимняя тропа)');
+  assert.equal(track.point_count, 3);
+  assert.equal(track.segments.length, 1);
+  assert.equal(track.waypoints.length, 1);
+  assert.equal(track.waypoints[0].name, 'Лунка №1 (яма 5м)');
+  assert.ok(track.distance_m > 500 && track.distance_m < 1200, `Unexpected distance_m: ${track.distance_m}`);
+  assert.equal(track.duration_s, 15 * 60);
+  assert.equal(track.elevation_gain_m, 5);
+
+  const geoVisible = buildGpxTracksGeoJson([track]);
+  assert.equal(geoVisible.type, 'FeatureCollection');
+  // 1 LineString + start + end + 1 waypoint = 4 features
+  assert.equal(geoVisible.features.length, 4);
+  assert.equal(geoVisible.features[0].geometry.type, 'LineString');
+
+  const geoHidden = buildGpxTracksGeoJson([{ ...track, visible: false }]);
+  assert.equal(geoHidden.features.length, 0, 'Hidden GPX tracks must be omitted from map overlay GeoJSON');
+
+  const invalid = parseGpxRouteTrack('<notgpx></notgpx>', { fileName: 'bad.gpx' });
+  assert.equal(invalid.ok, false);
+});
+
+test('seasonalFishing ranks species and water bodies strictly from highest to lowest catch probability by month', async () => {
+  const {
+    rankSpeciesForMonth,
+    rankWaterBodiesForSpeciesInMonth,
+    rankFishForWaterBodyInMonth,
+  } = await import('./seasonalFishing');
+  const { SEED_SPECIES, SEED_WATER_BODIES, SEED_REPORTS } = await import('../data/seedData');
+
+  const janRankings = rankSpeciesForMonth({
+    speciesList: SEED_SPECIES,
+    waterBodies: SEED_WATER_BODIES,
+    reports: SEED_REPORTS,
+    month: 1,
+  });
+  const julRankings = rankSpeciesForMonth({
+    speciesList: SEED_SPECIES,
+    waterBodies: SEED_WATER_BODIES,
+    reports: SEED_REPORTS,
+    month: 7,
+  });
+
+  assert.equal(janRankings.length, SEED_SPECIES.length);
+  assert.equal(julRankings.length, SEED_SPECIES.length);
+
+  // Verify strictly non-increasing probability order for both months
+  for (let i = 1; i < janRankings.length; i++) {
+    assert.ok(
+      janRankings[i - 1].probability >= janRankings[i].probability,
+      `January species must be sorted descending: ${janRankings[i - 1].probability} < ${janRankings[i].probability}`
+    );
+  }
+  for (let i = 1; i < julRankings.length; i++) {
+    assert.ok(
+      julRankings[i - 1].probability >= julRankings[i].probability,
+      `July species must be sorted descending: ${julRankings[i - 1].probability} < ${julRankings[i].probability}`
+    );
+  }
+
+  // Winter cold-water species (nalim / burbot) should rank well above warm-water karp in January
+  const janBurbot = janRankings.find((r) => r.species.id === 'nalim');
+  const janCarp = janRankings.find((r) => r.species.id === 'karp');
+  assert.ok(janBurbot && janCarp, 'Expected nalim and karp in seed species');
+  assert.ok(
+    janBurbot!.probability > janCarp!.probability,
+    `Nalim (${janBurbot!.probability}%) should outrank karp (${janCarp!.probability}%) in January`
+  );
+
+  // Warm-water karp should outrank winter nalim in July
+  const julBurbot = julRankings.find((r) => r.species.id === 'nalim');
+  const julCarp = julRankings.find((r) => r.species.id === 'karp');
+  assert.ok(
+    julCarp!.probability > julBurbot!.probability,
+    `Karp (${julCarp!.probability}%) should outrank nalim (${julBurbot!.probability}%) in July`
+  );
+
+  // Verify water bodies for a species are ranked strictly descending by probability
+  const pike = SEED_SPECIES.find((s) => s.id === 'pike')!;
+  const octPikeWaterBodies = rankWaterBodiesForSpeciesInMonth({
+    species: pike,
+    waterBodies: SEED_WATER_BODIES,
+    speciesList: SEED_SPECIES,
+    reports: SEED_REPORTS,
+    month: 10,
+  });
+  assert.ok(octPikeWaterBodies.length > 0, 'Expected matching water bodies for pike in October');
+  for (let i = 1; i < octPikeWaterBodies.length; i++) {
+    assert.ok(
+      octPikeWaterBodies[i - 1].probability >= octPikeWaterBodies[i].probability,
+      'Water bodies for species must be sorted descending by probability'
+    );
+  }
+
+  // Verify per-water-body fish ranking in a chosen month is strictly descending
+  const wbFish = rankFishForWaterBodyInMonth({
+    waterBody: SEED_WATER_BODIES[0],
+    speciesList: SEED_SPECIES,
+    reports: SEED_REPORTS,
+    month: 9,
+  });
+  assert.ok(wbFish.length > 0, 'Expected ranked fish for seed water body in September');
+  for (let i = 1; i < wbFish.length; i++) {
+    assert.ok(
+      wbFish[i - 1].probability >= wbFish[i].probability,
+      'Fish in water body must be sorted descending by monthly probability'
+    );
+  }
+});
+
+test('waterGeometry highlights only exact water contours and riverbeds, cuts out islands, and never fills dry land with synthetic polygons', async () => {
+  const {
+    isSyntheticPlaceholderPolygon,
+    normalizeRingWinding,
+    signedRingArea,
+    stitchOsmRelationWays,
+    groupOuterAndInnerRings,
+    buildWaterBodiesMapLayersGeoJson,
+  } = await import('./waterGeometry');
+  const { SEED_WATER_BODIES } = await import('../data/seedData');
+
+  // 1) Synthetic 4-corner box and 8-vertex regular octagon must be detected as placeholders
+  const box: [number, number][] = [
+    [35.2, 51.6],
+    [35.21, 51.6],
+    [35.21, 51.61],
+    [35.2, 51.61],
+    [35.2, 51.6],
+  ];
+  assert.equal(isSyntheticPlaceholderPolygon(box), true);
+
+  const octagon: [number, number][] = [];
+  for (let i = 0; i <= 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    octagon.push([35.25 + Math.cos(a) * 0.005, 51.65 + Math.sin(a) * 0.003]);
+  }
+  assert.equal(isSyntheticPlaceholderPolygon(octagon), true);
+
+  // Real irregular shoreline with 14 vertices must NOT be flagged as synthetic
+  const realShore: [number, number][] = [
+    [36.800, 56.000],
+    [36.805, 56.001],
+    [36.812, 56.000],
+    [36.818, 56.004],
+    [36.816, 56.009],
+    [36.823, 56.013],
+    [36.819, 56.018],
+    [36.810, 56.016],
+    [36.806, 56.020],
+    [36.798, 56.017],
+    [36.801, 56.011],
+    [36.795, 56.007],
+    [36.799, 56.003],
+    [36.800, 56.000],
+  ];
+  assert.equal(isSyntheticPlaceholderPolygon(realShore), false);
+
+  // 2) Winding order enforcement: outer CCW (>0), island hole CW (<0)
+  const ccwOuter = normalizeRingWinding(realShore, true);
+  assert.ok(signedRingArea(ccwOuter) > 0, 'Outer ring must be CCW');
+  const cwHole = normalizeRingWinding(
+    [
+      [36.806, 56.006],
+      [36.812, 56.006],
+      [36.812, 56.011],
+      [36.806, 56.011],
+      [36.806, 56.006],
+    ],
+    false
+  );
+  assert.ok(signedRingArea(cwHole) < 0, 'Island hole ring must be CW');
+
+  // 3) OSM relation way stitching + island cutout grouping
+  const stitchedOuters = stitchOsmRelationWays([
+    realShore.slice(0, 7),
+    // Reverse second half intentionally to verify endpoint reversal stitching
+    [...realShore.slice(6)].reverse(),
+  ]);
+  assert.equal(stitchedOuters.length, 1);
+
+  const islandRing: [number, number][] = [
+    [36.807, 56.006],
+    [36.811, 56.006],
+    [36.811, 56.010],
+    [36.807, 56.010],
+    [36.807, 56.006],
+  ];
+  const parts = groupOuterAndInnerRings(stitchedOuters, [islandRing]);
+  assert.equal(parts.length, 1);
+  assert.equal(parts[0].length, 2, 'Island cutout must be preserved as inner ring');
+  assert.ok(signedRingArea(parts[0][0]) > 0);
+  assert.ok(signedRingArea(parts[0][1]) < 0);
+
+  // 4) Map layers GeoJSON builder separates exact polygons, river centerlines, and approximate pins
+  const exactWb: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-exact-island',
+    geometry_quality: 'exact',
+    polygon: realShore,
+    polygon_parts: parts,
+  };
+  const riverCenterlineWb: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-river-channel',
+    type: 'river',
+    geometry_quality: 'centerline',
+    river_lines: [
+      [
+        [35.25, 51.65],
+        [35.26, 51.655],
+        [35.27, 51.662],
+        [35.28, 51.659],
+      ],
+    ],
+  };
+  const approxWb: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-approx-placeholder',
+    geometry_quality: 'approximate',
+    polygon: octagon,
+  };
+  const unflaggedSyntheticWb: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-legacy-box',
+    geometry_quality: undefined,
+    polygon: box,
+  };
+
+  const layers = buildWaterBodiesMapLayersGeoJson(
+    [exactWb, riverCenterlineWb, approxWb, unflaggedSyntheticWb],
+    exactWb.id
+  );
+  assert.equal(layers.waterPolygons.features.length, 1, 'Only exact real shoreline should produce polygon fill');
+  assert.equal(layers.waterPolygons.features[0].id, 'wb-exact-island');
+  assert.equal(layers.waterRivers.features.length, 1, 'Centerline river should render in river line layer');
+  assert.equal(layers.waterRivers.features[0].id, 'wb-river-channel');
+  // Approximate + unflagged synthetic box + centerline pin => 3 marker features, ZERO land-covering polygons
+  assert.equal(
+    layers.waterMarkers.features.some((f) => f.properties.id === 'wb-approx-placeholder'),
+    true
+  );
+  assert.equal(
+    layers.waterMarkers.features.some((f) => f.properties.id === 'wb-legacy-box'),
+    true
+  );
+
+  // Verify seed water bodies with approximate placeholders (Lgov Seym, Lgov city lake, Sugrovo dam, Luchinskoe oxbow)
+  // are routed to waterMarkers instead of shading dry land with polygon fills
+  const seedLayers = buildWaterBodiesMapLayersGeoJson(SEED_WATER_BODIES, null);
+  const seedPolyIds = new Set(seedLayers.waterPolygons.features.map((f) => f.properties.id));
+  assert.equal(seedPolyIds.has('wb-istra-res'), true, 'Exact OSM Istra contour must render as polygon');
+  assert.equal(seedPolyIds.has('wb-seym-lgov'), false, 'Approximate Seym placeholder must not shade dry land');
+  assert.equal(seedPolyIds.has('wb-lgov-city-lake'), false, 'Approximate Lgov city lake must not shade dry land');
+  assert.equal(seedPolyIds.has('wb-sugrovo-dam'), false, 'Approximate Sugrovo dam must not shade dry land');
+});
+
+test('expanded freshwater fish catalog includes 30+ species (себель/верховодка/уклейка, бычок, пескарь, карп, сазан, etc.) and OSM tag parser detects them', async () => {
+  const { SEED_SPECIES } = await import('../data/seedData');
+  const { parseOsmWaterTags } = await import('../server/proxies');
+
+  assert.ok(
+    SEED_SPECIES.length >= 30,
+    `Expected at least 30 fish species in SEED_SPECIES, got ${SEED_SPECIES.length}`
+  );
+
+  const byId = new Map(SEED_SPECIES.map((s) => [s.id, s]));
+  const requiredIds = [
+    'ukleyka',
+    'verkhovka',
+    'peskar',
+    'bychok',
+    'karp',
+    'sazan',
+    'ersh',
+    'podust',
+    'chehon',
+    'bersh',
+    'elets',
+    'bely_amur',
+    'tolstolobik',
+    'sinets',
+    'forel',
+  ];
+  for (const id of requiredIds) {
+    const sp = byId.get(id);
+    assert.ok(sp, `Missing required fish species: ${id}`);
+    assert.ok(sp.lures.length >= 1, `${id} should define at least 1 lure/bait`);
+    assert.ok(sp.active_hours && sp.active_hours.length >= 6, `${id} must define active_hours`);
+    for (let m = 1; m <= 12; m++) {
+      assert.ok(
+        typeof sp.season_activity[m] === 'number' && sp.season_activity[m] >= 0 && sp.season_activity[m] <= 100,
+        `${id} month ${m} season_activity must be 0..100`
+      );
+    }
+  }
+
+  // Regional names for bleak (себель / верховодка / уклейка) must be discoverable by name search
+  const ukleyka = byId.get('ukleyka')!;
+  const ukleykaLower = ukleyka.name.toLowerCase();
+  assert.ok(ukleykaLower.includes('уклейк'), 'ukleyka name must include уклейка');
+  assert.ok(ukleykaLower.includes('себел'), 'ukleyka name must include себель');
+  assert.ok(ukleykaLower.includes('верховодк'), 'ukleyka name must include верховодка');
+
+  // OSM species tag parser recognizes new Russian & regional fish names
+  const parsed = parseOsmWaterTags({
+    species: 'себель; пескарь; бычок; сазан; карп; ёрш; толстолобик; форель',
+  });
+  const parsedIds = (parsed.inhabiting_species ?? []).map((s) => s.species_id);
+  assert.ok(parsedIds.includes('ukleyka'), 'OSM parser should recognize себель as ukleyka');
+  assert.ok(parsedIds.includes('peskar'), 'OSM parser should recognize пескарь');
+  assert.ok(parsedIds.includes('bychok'), 'OSM parser should recognize бычок');
+  assert.ok(parsedIds.includes('sazan'), 'OSM parser should recognize сазан');
+  assert.ok(parsedIds.includes('ersh'), 'OSM parser should recognize ёрш');
+  assert.ok(parsedIds.includes('tolstolobik'), 'OSM parser should recognize толстолобик');
+  assert.ok(parsedIds.includes('forel'), 'OSM parser should recognize форель');
+});
+
+test('buildOptimalDepartureSummary identifies best contiguous 24h F-Index window and departure time', async () => {
+  const { buildOptimalDepartureSummary } = await import('./fishLogic');
+
+  const slots: BiteForecastSlot[] = [
+    { date: '2026-11-25', day_label: 'Сегодня', hour_interval: '00:00', f_index: 38, probability_label: 'низкая вероятность', factors: [] },
+    { date: '2026-11-25', day_label: 'Сегодня', hour_interval: '03:00', f_index: 54, probability_label: 'средняя вероятность', factors: [] },
+    { date: '2026-11-25', day_label: 'Сегодня', hour_interval: '06:00', f_index: 78, probability_label: 'высокая вероятность', factors: [] },
+    { date: '2026-11-25', day_label: 'Сегодня', hour_interval: '09:00', f_index: 72, probability_label: 'высокая вероятность', factors: [] },
+    { date: '2026-11-25', day_label: 'Сегодня', hour_interval: '12:00', f_index: 52, probability_label: 'средняя вероятность', factors: [] },
+    { date: '2026-11-25', day_label: 'Сегодня', hour_interval: '15:00', f_index: 61, probability_label: 'средняя вероятность', factors: [] },
+    { date: '2026-11-25', day_label: 'Сегодня', hour_interval: '18:00', f_index: 64, probability_label: 'средняя вероятность', factors: [] },
+    { date: '2026-11-25', day_label: 'Сегодня', hour_interval: '21:00', f_index: 44, probability_label: 'средняя вероятность', factors: [] },
+  ];
+
+  const summary = buildOptimalDepartureSummary(slots);
+  assert.ok(summary, 'Expected optimal departure summary');
+  assert.equal(summary!.quality, 'optimal');
+  assert.equal(summary!.startIndex, 2);
+  assert.equal(summary!.endIndex, 3);
+  assert.equal(summary!.optimalRangeLabel, '06:00–12:00');
+  assert.equal(summary!.departureTimeLabel, '05:30');
+  assert.equal(summary!.peakFIndex, 78);
+  assert.equal(summary!.avgFIndex, 75);
+  assert.equal(summary!.peakHour, '06:00');
+
+  // Midnight departure wrap check (00:00 -> 23:30)
+  const nightSlots: BiteForecastSlot[] = [
+    { date: '2026-11-26', day_label: 'Завтра', hour_interval: '00:00', f_index: 74, probability_label: 'высокая вероятность', factors: [] },
+    { date: '2026-11-26', day_label: 'Завтра', hour_interval: '03:00', f_index: 50, probability_label: 'средняя вероятность', factors: [] },
+  ];
+  const nightSummary = buildOptimalDepartureSummary(nightSlots);
+  assert.equal(nightSummary?.departureTimeLabel, '23:30');
+  assert.equal(nightSummary?.optimalRangeLabel, '00:00–03:00');
+
+  assert.equal(buildOptimalDepartureSummary([]), null);
+});
+
+test('buildMoonPhaseFishingAdvice produces distinct lighting guidance for full moon, overcast full moon, new moon, and quarters', async () => {
+  const { buildMoonPhaseFishingAdvice } = await import('./fishLogic');
+  const { SEED_SPECIES } = await import('../data/seedData');
+
+  const sudak = SEED_SPECIES.find((s) => s.id === 'sudak')!;
+  const lesh = SEED_SPECIES.find((s) => s.id === 'lesh')!;
+
+  const clearFullMoon = buildMoonPhaseFishingAdvice(
+    { moon_phase: 'Полнолуние', moon_illumination: 96, cloud_cover_pct: 15 },
+    sudak
+  )!;
+  assert.equal(clearFullMoon.tone, 'caution');
+  assert.equal(clearFullMoon.cloudMitigated, false);
+  assert.ok(clearFullMoon.behaviorSummary.includes('96%'));
+  assert.ok(clearFullMoon.tacticalTip.length > 10);
+
+  const overcastFullMoon = buildMoonPhaseFishingAdvice(
+    { moon_phase: 'Полнолуние', moon_illumination: 96, cloud_cover_pct: 88 },
+    sudak
+  )!;
+  assert.equal(overcastFullMoon.tone, 'favorable');
+  assert.equal(overcastFullMoon.cloudMitigated, true);
+
+  const newMoonPredator = buildMoonPhaseFishingAdvice(
+    { moon_phase: 'Новолуние', moon_illumination: 4, cloud_cover_pct: 40 },
+    sudak
+  )!;
+  assert.equal(newMoonPredator.tone, 'favorable');
+  assert.ok(newMoonPredator.impactLabel.includes('дневной'));
+
+  const waningQuarter = buildMoonPhaseFishingAdvice(
+    { moon_phase: 'Убывающая луна', moon_illumination: 48, cloud_cover_pct: 40 },
+    lesh
+  )!;
+  assert.equal(waningQuarter.isWaning, true);
+  assert.equal(waningQuarter.tone, 'neutral');
+
+  assert.equal(buildMoonPhaseFishingAdvice(null), null);
+});
+
+test('Google Places water-body filter classifies Russian lakes, ponds, dams, rivers, and rejects businesses while detecting 429 quota errors', async () => {
+  const {
+    buildWaterBodyFromGooglePlace,
+    inferWaterBodyTypeFromGooglePlace,
+    isGooglePlaceWaterBody,
+    isGoogleQuotaError,
+  } = await import('../server/googlePlaces');
+
+  const cityLake = {
+    id: 'ChIJ_lgov_lake',
+    displayName: { text: 'Городское озеро, Льгов' },
+    formattedAddress: 'Льгов, Курская область, Россия',
+    location: { latitude: 51.663, longitude: 35.264 },
+    types: ['natural_feature'],
+    primaryType: 'natural_feature',
+    googleMapsUri: 'https://maps.google.com/?cid=12345',
+  };
+  assert.equal(isGooglePlaceWaterBody(cityLake), true);
+  assert.equal(inferWaterBodyTypeFromGooglePlace(cityLake), 'lake');
+  const wb = buildWaterBodyFromGooglePlace(cityLake);
+  assert.ok(wb, 'Expected WaterBody from Google Place');
+  assert.equal(wb!.source, 'google_places');
+  assert.equal(wb!.geometry_quality, 'approximate');
+  assert.equal(wb!.google_place_id, 'ChIJ_lgov_lake');
+  assert.equal(wb!.google_maps_uri, 'https://maps.google.com/?cid=12345');
+
+  const dam = {
+    id: 'ChIJ_sugrovo_dam',
+    displayName: { text: 'Плотина в Сугрово' },
+    location: { latitude: 51.62, longitude: 35.34 },
+    types: ['point_of_interest'],
+  };
+  assert.equal(isGooglePlaceWaterBody(dam), true);
+  assert.equal(inferWaterBodyTypeFromGooglePlace(dam), 'reservoir');
+
+  const paidPond = {
+    id: 'ChIJ_fish_pond',
+    displayName: { text: 'Платная рыбалка Пруд Карповый' },
+    location: { latitude: 55.91, longitude: 36.74 },
+    types: ['fishing_pond'],
+    primaryType: 'fishing_pond',
+  };
+  assert.equal(isGooglePlaceWaterBody(paidPond), true);
+  assert.equal(inferWaterBodyTypeFromGooglePlace(paidPond), 'pond');
+  assert.equal(buildWaterBodyFromGooglePlace(paidPond)?.fishing_access, 'paid');
+
+  // Reject hotels/cafes/streets even if their name mentions "Озеро" or "Речная"
+  assert.equal(
+    isGooglePlaceWaterBody({
+      id: 'cafe1',
+      displayName: { text: 'Кафе У Озера' },
+      location: { latitude: 55.9, longitude: 36.8 },
+      types: ['cafe', 'restaurant'],
+      primaryType: 'cafe',
+    }),
+    false
+  );
+  assert.equal(
+    isGooglePlaceWaterBody({
+      id: 'street1',
+      displayName: { text: 'Улица Речная' },
+      location: { latitude: 55.9, longitude: 36.8 },
+      types: ['route'],
+      primaryType: 'route',
+    }),
+    false
+  );
+
+  // Quota error detection (no false positives on 200 or 404)
+  assert.equal(isGoogleQuotaError(429, ''), true);
+  assert.equal(isGoogleQuotaError(403, '{"error":{"status":"RESOURCE_EXHAUSTED"}}'), true);
+  assert.equal(isGoogleQuotaError(200, '{"places":[]}'), false);
+  assert.equal(isGoogleQuotaError(404, '{"error":{"status":"NOT_FOUND"}}'), false);
+});
+
+test('mergeSpeciesCatalog upgrades stale 16-species cache to full 30-species catalog without losing newly added fish', async () => {
+  const { mergeSpeciesCatalog } = await import('../utils/offlineDb');
+  const { SEED_SPECIES } = await import('../data/seedData');
+
+  const staleOldCache = SEED_SPECIES.slice(0, 16);
+  const merged = mergeSpeciesCatalog(staleOldCache, SEED_SPECIES);
+
+  assert.equal(merged.length, SEED_SPECIES.length);
+  assert.ok(merged.length >= 30, `Expected at least 30 species after merge, got ${merged.length}`);
+  const mergedIds = new Set(merged.map((s) => s.id));
+  assert.equal(mergedIds.has('ukleyka'), true);
+  assert.equal(mergedIds.has('verkhovka'), true);
+  assert.equal(mergedIds.has('peskar'), true);
+  assert.equal(mergedIds.has('bychok'), true);
+  assert.equal(mergedIds.has('sazan'), true);
+  assert.equal(mergedIds.has('forel'), true);
+});
 
 
 

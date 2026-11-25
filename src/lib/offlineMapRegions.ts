@@ -178,6 +178,15 @@ export function normalizeBboxSelection(a: LatLng, b: LatLng): MapBbox {
   };
 }
 
+export interface OfflineDownloadProgress {
+  done: number;
+  total: number;
+  cached: number;
+  failed: number;
+  bytesDownloaded: number;
+  currentZoom: number;
+}
+
 export async function downloadOfflineMapRegion(params: {
   id: string;
   name: string;
@@ -186,13 +195,14 @@ export async function downloadOfflineMapRegion(params: {
   maxZoom: number;
   waterBodies: WaterBody[];
   signal?: AbortSignal;
-  onProgress?: (done: number, total: number) => void;
+  onProgress?: (done: number, total: number, detail?: OfflineDownloadProgress) => void;
 }): Promise<OfflineMapRegion> {
   const { id, name, bbox, minZoom, maxZoom, waterBodies, signal, onProgress } = params;
   const tiles = computeTileCoordsForBbox(bbox, minZoom, maxZoom, 220);
   const total = tiles.length;
   let completed = 0;
   let cachedCount = 0;
+  let failedCount = 0;
   let sizeBytes = 0;
 
   const hasCaches = typeof caches !== 'undefined';
@@ -207,11 +217,13 @@ export async function downloadOfflineMapRegion(params: {
         throw new DOMException('Aborted', 'AbortError');
       }
       const tile = tiles[idx++];
+      let tileSucceeded = false;
       try {
         const existingIdb = await offlineDb.getMapTile(tile.url);
         if (existingIdb && existingIdb.data && existingIdb.data.byteLength > 0) {
           sizeBytes += existingIdb.size_bytes || existingIdb.data.byteLength;
           cachedCount++;
+          tileSucceeded = true;
         } else {
           const perTileController = new AbortController();
           const timeoutId = setTimeout(() => perTileController.abort(), 4500);
@@ -239,6 +251,7 @@ export async function downloadOfflineMapRegion(params: {
               }
               sizeBytes += buffer.byteLength;
               cachedCount++;
+              tileSucceeded = true;
             }
           } finally {
             clearTimeout(timeoutId);
@@ -251,8 +264,16 @@ export async function downloadOfflineMapRegion(params: {
         }
         // Individual tile timeout or network error should not abort the remaining region tiles
       } finally {
+        if (!tileSucceeded) failedCount++;
         completed++;
-        onProgress?.(completed, total);
+        onProgress?.(completed, total, {
+          done: completed,
+          total,
+          cached: cachedCount,
+          failed: failedCount,
+          bytesDownloaded: sizeBytes,
+          currentZoom: tile.z,
+        });
       }
     }
   };

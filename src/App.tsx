@@ -63,7 +63,9 @@ import {
   downloadOfflineMapRegion,
   isPointInBbox,
   removeOfflineRegionTiles,
+  type OfflineDownloadProgress,
 } from './lib/offlineMapRegions';
+import { estimateZoomForBbox } from './lib/gpxParser';
 import {
   SEED_ACCESS_POINTS,
   SEED_BATHYMETRY_POINTS,
@@ -83,6 +85,7 @@ import type {
   FishAbundance,
   FishSpecies,
   GoodBiteWaterBodyItem,
+  GpxRouteTrack,
   KnotGuide,
   LatLng,
   MapBbox,
@@ -99,7 +102,7 @@ import type {
   WaterBodyType,
   WeatherSnapshot,
 } from './lib/types';
-import { offlineDb, type KnotsCacheMeta } from './utils/offlineDb';
+import { mergeSpeciesCatalog, offlineDb, type KnotsCacheMeta } from './utils/offlineDb';
 
 const DEFAULT_ORIGIN: LatLng = { lat: 55.975, lng: 36.825 };
 const DEFAULT_ALERT_SETTINGS: BiteAlertSettings = {
@@ -159,7 +162,14 @@ export default function App() {
     }[]
   >([]);
   const [discoveringOsm, setDiscoveringOsm] = useState(false);
+  const [gmpQuotaExceeded, setGmpQuotaExceeded] = useState(false);
   const [mapFocusPoint, setMapFocusPoint] = useState<{ lat: number; lng: number; zoom?: number; ts: number } | null>(null);
+
+  useEffect(() => {
+    const handleQuotaExceeded = () => setGmpQuotaExceeded(true);
+    window.addEventListener('gmp-quota-exceeded', handleQuotaExceeded);
+    return () => window.removeEventListener('gmp-quota-exceeded', handleQuotaExceeded);
+  }, []);
 
   // Map & Modal states
   const [layers, setLayers] = useState<MapLayerToggles>({
@@ -167,6 +177,7 @@ export default function App() {
     contours: true,
     heatmap: true,
     fishActivityHeatmap: true,
+    gpxTracks: true,
     prospective: true,
     openSeaMap: false,
     topoOverlay: false,
@@ -202,6 +213,7 @@ export default function App() {
     getNotificationPermissionState()
   );
   const [offlineRegions, setOfflineRegions] = useState<OfflineMapRegion[]>([]);
+  const [gpxTracks, setGpxTracks] = useState<GpxRouteTrack[]>([]);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const alertDispatchLockRef = useRef<Set<string>>(new Set());
   const waterBodiesRef = useRef<WaterBody[]>(waterBodies);
@@ -244,21 +256,23 @@ export default function App() {
     onNewDepthPoint: handleIncomingDepthPoint,
   });
 
-  // Hydrate persistent favorites, alert settings, alert history, and offline regions
+  // Hydrate persistent favorites, alert settings, alert history, offline regions, and GPX tracks
   useEffect(() => {
     let active = true;
     async function loadPreferences() {
-      const [favs, savedAlerts, savedHistory, savedRegions] = await Promise.all([
+      const [favs, savedAlerts, savedHistory, savedRegions, savedGpxTracks] = await Promise.all([
         offlineDb.getFavoriteIds(),
         offlineDb.getAlertSettings(),
         offlineDb.getAlertHistory(),
         offlineDb.getOfflineRegions(),
+        offlineDb.getGpxTracks(),
       ]);
       if (!active) return;
       setFavoriteIds(favs);
       if (savedAlerts) setAlertSettings(savedAlerts);
       setAlertHistory(savedHistory);
       setOfflineRegions(savedRegions);
+      setGpxTracks(savedGpxTracks);
       setNotificationPermission(getNotificationPermissionState());
       setPrefsLoaded(true);
     }
@@ -293,7 +307,7 @@ export default function App() {
         ]);
         if (!active) return;
         const wbs = cachedWbs.length > 0 ? cachedWbs : SEED_WATER_BODIES;
-        const sp = cachedRef.species.length > 0 ? cachedRef.species : SEED_SPECIES;
+        const sp = mergeSpeciesCatalog(cachedRef.species, SEED_SPECIES);
         const kn = cachedKnots.length > 0 ? cachedKnots : cachedRef.knots.length > 0 ? cachedRef.knots : SEED_KNOTS;
         const reps = cachedReports.length > 0 ? cachedReports : SEED_REPORTS;
         setWaterBodies(wbs);
@@ -320,10 +334,10 @@ export default function App() {
 
       // Stale-While-Revalidate for speciesList: serve IndexedDB cache immediately and force-revalidate on stable connection
       const fetchFreshSpecies = async (): Promise<FishSpecies[]> => {
-        const res = await fetch(apiUrl('/api/v1/species'));
+        const res = await fetch(apiUrl(`/api/v1/species?v=${SEED_DATA_VERSION}`), { cache: 'no-store' });
         if (!res.ok) throw new Error('Species fetch failed');
         const json = (await res.json()) as { species?: FishSpecies[] };
-        return Array.isArray(json.species) ? json.species : [];
+        return mergeSpeciesCatalog(Array.isArray(json.species) ? json.species : [], SEED_SPECIES);
       };
 
       const swrSpecies = await offlineDb.getSpeciesListSWR({
@@ -333,18 +347,18 @@ export default function App() {
         forceRevalidate: isOnline,
         onRevalidated: (fresh) => {
           if (active && fresh.length > 0) {
-            setSpeciesList(fresh);
+            setSpeciesList(mergeSpeciesCatalog(fresh, SEED_SPECIES));
           }
         },
       });
       if (active && swrSpecies.species.length > 0) {
-        setSpeciesList(swrSpecies.species);
+        setSpeciesList(mergeSpeciesCatalog(swrSpecies.species, SEED_SPECIES));
       }
 
       try {
         const [wbRes, spRes, knotsRes, repRes, weatherRes, meRes] = await Promise.all([
           fetch(apiUrl('/api/v1/water-bodies?include_unnamed=true')),
-          fetch(apiUrl('/api/v1/species')),
+          fetch(apiUrl(`/api/v1/species?v=${SEED_DATA_VERSION}`), { cache: 'no-store' }),
           fetch(apiUrl('/api/v1/knots')),
           fetch(apiUrl('/api/v1/reports')),
           fetch(apiUrl(`/api/v1/weather?lat=${DEFAULT_ORIGIN.lat}&lng=${DEFAULT_ORIGIN.lng}`)),
@@ -362,7 +376,10 @@ export default function App() {
 
         if (!active) return;
         const wbs: WaterBody[] = wbJson.items ?? [];
-        const sp: FishSpecies[] = spJson.species ?? [];
+        const sp: FishSpecies[] = mergeSpeciesCatalog(
+          Array.isArray(spJson.species) ? spJson.species : [],
+          SEED_SPECIES
+        );
         const kn: KnotGuide[] =
           Array.isArray(knotsJson.items) && knotsJson.items.length > 0
             ? knotsJson.items
@@ -399,7 +416,7 @@ export default function App() {
           offlineDb.getWeather(),
         ]);
         const wbs = cachedWbs.length > 0 ? cachedWbs : SEED_WATER_BODIES;
-        const sp = cachedRef.species.length > 0 ? cachedRef.species : SEED_SPECIES;
+        const sp = mergeSpeciesCatalog(cachedRef.species, SEED_SPECIES);
         const kn = cachedKnots.length > 0 ? cachedKnots : cachedRef.knots.length > 0 ? cachedRef.knots : SEED_KNOTS;
         const reps = cachedReports.length > 0 ? cachedReports : SEED_REPORTS;
         const wx = cachedWeather ?? (await fetchOpenMeteoWeatherDirect(DEFAULT_ORIGIN.lat, DEFAULT_ORIGIN.lng));
@@ -945,7 +962,7 @@ export default function App() {
       minZoom: number;
       maxZoom: number;
       signal: AbortSignal;
-      onProgress: (done: number, total: number) => void;
+      onProgress: (done: number, total: number, detail?: OfflineDownloadProgress) => void;
     }) => {
       const region = await downloadOfflineMapRegion({
         ...params,
@@ -1007,12 +1024,83 @@ export default function App() {
     [offlineRegions, showToast]
   );
 
+  const handleImportGpxTrack = useCallback(
+    async (track: GpxRouteTrack) => {
+      setGpxTracks((prev) => {
+        const next = [track, ...prev];
+        void offlineDb.saveGpxTracks(next);
+        return next;
+      });
+      setLayers((prev) => (prev.gpxTracks ? prev : { ...prev, gpxTracks: true }));
+      showToast(`GPX-маршрут «${track.name}» добавлен слоем на карту.`);
+    },
+    [showToast]
+  );
+
+  const handleToggleGpxTrackVisibility = useCallback((trackId: string) => {
+    setGpxTracks((prev) => {
+      const next = prev.map((t) => (t.id === trackId ? { ...t, visible: !t.visible } : t));
+      void offlineDb.saveGpxTracks(next);
+      return next;
+    });
+  }, []);
+
+  const handleDeleteGpxTrack = useCallback(
+    async (trackId: string) => {
+      setGpxTracks((prev) => {
+        const next = prev.filter((t) => t.id !== trackId);
+        void offlineDb.saveGpxTracks(next);
+        return next;
+      });
+      showToast('GPX-маршрут удалён.');
+    },
+    [showToast]
+  );
+
+  const handleFocusGpxTrack = useCallback((track: GpxRouteTrack) => {
+    setGpxTracks((prev) => {
+      if (prev.some((t) => t.id === track.id && !t.visible)) {
+        const next = prev.map((t) => (t.id === track.id ? { ...t, visible: true } : t));
+        void offlineDb.saveGpxTracks(next);
+        return next;
+      }
+      return prev;
+    });
+    setLayers((prev) => (prev.gpxTracks ? prev : { ...prev, gpxTracks: true }));
+    const centerLat = (track.bbox.north + track.bbox.south) / 2;
+    const centerLng = (track.bbox.east + track.bbox.west) / 2;
+    const zoom = estimateZoomForBbox(track.bbox);
+    setMapFocusPoint({ lat: centerLat, lng: centerLng, zoom, ts: Date.now() });
+    setActiveTab('map');
+  }, []);
+
   // Handlers
+  const contourUpgradedIdsRef = useRef<Set<string>>(new Set());
+
   const handleSelectWaterBody = (wb: WaterBody) => {
     setSelectedWaterBody(wb);
     setActiveTab('map');
     if (typeof window !== 'undefined' && window.innerWidth < 1024) {
       setMobileSheetOpen(true);
+    }
+    if (
+      isOnline &&
+      wb.geometry_quality === 'approximate' &&
+      !contourUpgradedIdsRef.current.has(wb.id)
+    ) {
+      contourUpgradedIdsRef.current.add(wb.id);
+      const baseName = (wb.name || wb.display_label).replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+      if (baseName.length >= 2) {
+        void handleDiscoverOsmWaterBodies({
+          lat: wb.center.lat,
+          lng: wb.center.lng,
+          radius_km: 12,
+          query: baseName,
+          select_title: wb.display_label,
+          select_type: wb.type,
+          autoSelectNearest: false,
+        });
+      }
     }
   };
 
@@ -1077,10 +1165,21 @@ export default function App() {
         kind: 'hydro',
         region_id: 'all',
         major_only: 'false',
+        lat: String(userOrigin.lat),
+        lng: String(userOrigin.lng),
       });
       const res = await fetch(apiUrl(`/api/v1/geocode/search?${qs.toString()}`));
+      if (res.status === 429) {
+        window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+      }
       if (res.ok) {
-        const json = (await res.json()) as { items?: typeof searchResults };
+        const json = (await res.json()) as {
+          items?: typeof searchResults;
+          google_places_quota_exceeded?: boolean;
+        };
+        if (json.google_places_quota_exceeded) {
+          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+        }
         if (Array.isArray(json.items) && json.items.length > 0) {
           setSearchResults(json.items);
           return;
@@ -1622,6 +1721,9 @@ export default function App() {
             select_region: params.select_region,
           }),
         });
+        if (res.status === 429) {
+          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+        }
         if (!res.ok) {
           await runDirectFallback();
           return;
@@ -1631,8 +1733,12 @@ export default function App() {
           items?: WaterBody[];
           added_count?: number;
           selected?: WaterBody | null;
+          google_places_quota_exceeded?: boolean;
           error?: string;
         };
+        if (json.google_places_quota_exceeded) {
+          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+        }
 
         const incoming = [...(json.discovered ?? json.items ?? []), ...(json.selected ? [json.selected] : [])];
         if (incoming.length === 0 && (params.query || params.select_title)) {
@@ -2029,6 +2135,40 @@ export default function App() {
         </div>
       )}
 
+      {/* Google Maps Platform Demo-Key Quota Exceeded Banner */}
+      {gmpQuotaExceeded && (
+        <div
+          role="alert"
+          data-testid="gmp-quota-banner"
+          className="sticky top-0 z-50 border-b border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-950 dark:border-amber-800 dark:bg-amber-950/90 dark:text-amber-100"
+        >
+          <div className="mx-auto flex max-w-[1600px] items-center justify-between gap-2.5">
+            <div className="flex min-w-0 items-center gap-2">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden="true" />
+              <p className="leading-snug">
+                Превышен демо-лимит запросов Google Maps Platform — поиск временно работает на базе OpenStreetMap.{' '}
+                <a
+                  href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-semibold underline hover:text-amber-800 dark:hover:text-amber-200"
+                >
+                  Как подключить собственный ключ API
+                </a>
+              </p>
+            </div>
+            <button
+              type="button"
+              aria-label="Скрыть уведомление о лимите Google Maps"
+              onClick={() => setGmpQuotaExceeded(false)}
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-amber-800 hover:bg-amber-200/60 dark:text-amber-200 dark:hover:bg-amber-900/60"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Descriptive Location Error Banner */}
       {locationError && (
         <div
@@ -2207,6 +2347,8 @@ export default function App() {
                 activeRoute={routeResult}
                 layers={layers}
                 onToggleLayers={setLayers}
+                gpxTracks={gpxTracks}
+                onToggleGpxTrackVisibility={handleToggleGpxTrackVisibility}
                 historicOverlay={historicOverlay}
                 userOrigin={userOrigin}
                 onLocateUser={handleLocateUser}
@@ -2265,6 +2407,7 @@ export default function App() {
                 onChangeRegionId={handleChangeRegionId}
                 majorOnly={majorOnly}
                 onToggleMajorOnly={setMajorOnly}
+                weather={effectiveWeather}
               />
 
               {/* Mobile Compact Selected Water Body Bottom Toolbar Container */}
@@ -2456,7 +2599,9 @@ export default function App() {
             speciesList={speciesList}
             knotsList={knotsList}
             waterBodies={waterBodies}
+            reports={reports}
             selectedWaterBody={selectedWaterBody}
+            onSelectWaterBody={handleSelectWaterBody}
             knotsCacheMeta={knotsCacheMeta}
             isOnline={isOnline}
             onRefreshKnotsCache={handleRefreshKnotsCache}
@@ -2503,6 +2648,11 @@ export default function App() {
               setMapFocusPoint({ lat: centerLat, lng: centerLng, zoom: 11, ts: Date.now() });
               setActiveTab('map');
             }}
+            gpxTracks={gpxTracks}
+            onImportGpxTrack={handleImportGpxTrack}
+            onToggleGpxTrackVisibility={handleToggleGpxTrackVisibility}
+            onDeleteGpxTrack={handleDeleteGpxTrack}
+            onFocusGpxTrack={handleFocusGpxTrack}
             onCreateDiaryEntry={(p) => submitReportOrQueue({ ...p, source: 'diary' })}
             onDeleteReport={handleDeleteReport}
             onAuthLogin={handleAuthLogin}

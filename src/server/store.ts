@@ -191,7 +191,13 @@ class FishCastStore {
       if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR, { recursive: true });
       }
-      fs.writeFileSync(DB_FILE, JSON.stringify(target, null, 2), 'utf-8');
+      // Google Maps Platform ToS compliance: never permanently store Google Places POIs on disk
+      const toSave: PersistedDatabase = {
+        ...target,
+        waterBodies: target.waterBodies.filter((wb) => wb.source !== 'google_places'),
+        accessPoints: target.accessPoints.filter((ap) => !ap.water_body_id.startsWith('wb-gmaps-')),
+      };
+      fs.writeFileSync(DB_FILE, JSON.stringify(toSave, null, 2), 'utf-8');
     } catch (err) {
       console.error('Failed to persist store:', err);
     }

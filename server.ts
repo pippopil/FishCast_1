@@ -43,6 +43,10 @@ import {
   isPhotonWaterFeature,
   recognizeFishPhotoViaGemini,
 } from './src/server/proxies.ts';
+import {
+  discoverNearbyWaterBodiesViaGooglePlaces,
+  searchWaterBodiesViaGooglePlaces,
+} from './src/server/googlePlaces.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const SESSION_SECRET = process.env.SESSION_SECRET || 'fishcast-dev-session-secret';
@@ -383,14 +387,37 @@ async function startServer() {
     const searchLng = shouldUseRegionCenter && regionDef ? regionDef.center.lng : lng;
 
     const normalizedQuery = (query ?? select_title)?.replace(/платин/gi, 'плотин');
-    const discoveredFromOsm = await discoverOsmWaterBodies({
-      lat: searchLat,
-      lng: searchLng,
-      radiusKm: radius_km ?? (regionDef && shouldUseRegionCenter ? regionDef.defaultRadiusKm : 16),
-      queryText: normalizedQuery,
-      regionId: shouldUseRegionCenter ? regionDef?.id : undefined,
-      majorOnly: Boolean(major_only),
-    });
+    const effectiveRadiusKm = radius_km ?? (regionDef && shouldUseRegionCenter ? regionDef.defaultRadiusKm : 16);
+    const [discoveredFromOsm, googlePlacesRes] = await Promise.all([
+      discoverOsmWaterBodies({
+        lat: searchLat,
+        lng: searchLng,
+        radiusKm: effectiveRadiusKm,
+        queryText: normalizedQuery,
+        regionId: shouldUseRegionCenter ? regionDef?.id : undefined,
+        majorOnly: Boolean(major_only),
+      }),
+      discoverNearbyWaterBodiesViaGooglePlaces({
+        lat: searchLat,
+        lng: searchLng,
+        radiusKm: effectiveRadiusKm,
+        queryText: normalizedQuery,
+      }),
+    ]);
+
+    // Merge OSM contours first (exact water boundaries), then fill gaps with Google Maps Places POIs
+    const combinedDiscovered: WaterBody[] = [...discoveredFromOsm];
+    for (const gWb of googlePlacesRes.items) {
+      const duplicateInOsm = combinedDiscovered.some(
+        (osmWb) =>
+          (osmWb.display_label.toLowerCase() === gWb.display_label.toLowerCase() &&
+            haversineMeters(osmWb.center, gWb.center) < 3500) ||
+          haversineMeters(osmWb.center, gWb.center) < 220
+      );
+      if (!duplicateInOsm) {
+        combinedDiscovered.push(gWb);
+      }
+    }
 
     const added: WaterBody[] = [];
     let upgradedCount = 0;
@@ -403,18 +430,26 @@ async function startServer() {
       );
       if (existing) {
         const isExistingOsm = existing.source === 'osm' || existing.id.startsWith('wb-osm-');
+        const qualityRank = (q?: WaterBody['geometry_quality']) =>
+          q === 'exact' ? 3 : q === 'centerline' ? 2 : 1;
+        const candidateBetterGeom =
+          qualityRank(candidate.geometry_quality) > qualityRank(existing.geometry_quality) ||
+          candidate.polygon.length > existing.polygon.length ||
+          (candidate.polygon_rings?.length ?? 0) > (existing.polygon_rings?.length ?? 0) ||
+          (candidate.polygon_parts?.length ?? 0) > (existing.polygon_parts?.length ?? 0) ||
+          ((candidate.river_lines?.length ?? 0) > 0 && !(existing.river_lines?.length ?? 0));
         const areaDiffRatio =
           Math.abs((existing.area_ha || 0) - (candidate.area_ha || 0)) / Math.max(1, candidate.area_ha || 1);
         const depthChanged = existing.max_depth_m !== candidate.max_depth_m;
         const shouldRefreshOsm =
           isExistingOsm &&
-          (candidate.polygon.length > existing.polygon.length ||
-            (candidate.polygon_rings?.length ?? 0) > (existing.polygon_rings?.length ?? 0) ||
-            areaDiffRatio > 0.3 ||
-            depthChanged);
+          (candidateBetterGeom || areaDiffRatio > 0.3 || depthChanged);
         if (shouldRefreshOsm) {
           existing.polygon = candidate.polygon;
           existing.polygon_rings = candidate.polygon_rings;
+          existing.polygon_parts = candidate.polygon_parts;
+          existing.river_lines = candidate.river_lines;
+          existing.geometry_quality = candidate.geometry_quality;
           existing.center = candidate.center;
           existing.area_ha = candidate.area_ha;
           existing.max_depth_m = candidate.max_depth_m;
@@ -447,7 +482,7 @@ async function startServer() {
       return candidate;
     };
 
-    const syncedList = discoveredFromOsm.map(registerWaterBody);
+    const syncedList = combinedDiscovered.map(registerWaterBody);
     let selected: WaterBody | null = null;
 
     if (select_title && select_title.trim().length > 0) {
@@ -495,7 +530,18 @@ async function startServer() {
       added_count: added.length,
       upgraded_count: upgradedCount,
       selected,
-      source: discoveredFromOsm.length > 0 ? 'osm-photon-overpass' : selected ? 'photon-osm' : 'local-cache',
+      google_places_count: googlePlacesRes.items.length,
+      google_places_quota_exceeded: googlePlacesRes.quotaExceeded,
+      source:
+        discoveredFromOsm.length > 0 && googlePlacesRes.items.length > 0
+          ? 'osm+google-places'
+          : googlePlacesRes.items.length > 0
+            ? 'google-places'
+            : discoveredFromOsm.length > 0
+              ? 'osm-photon-overpass'
+              : selected
+                ? 'photon-osm'
+                : 'local-cache',
     });
   });
 
@@ -753,7 +799,8 @@ async function startServer() {
 
   // --- Species, Knots & Recommendations ---
   app.get('/api/v1/species', (_req, res) => {
-    return res.json({ species: store.species, knots: store.knots });
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    return res.json({ species: store.species, knots: store.knots, total_species: store.species.length });
   });
 
   app.get('/api/v1/knots', (_req, res) => {
@@ -1120,6 +1167,8 @@ async function startServer() {
         water_body_id: string | null;
         is_water_body?: boolean;
         water_type?: WaterBodyType;
+        google_maps_uri?: string;
+        provider?: 'osm' | 'google_places';
       }>;
     }
   >();
@@ -1154,6 +1203,8 @@ async function startServer() {
       water_body_id: string | null;
       is_water_body?: boolean;
       water_type?: WaterBodyType;
+      google_maps_uri?: string;
+      provider?: 'osm' | 'google_places';
     }> = store.db.waterBodies
       .filter((wb) => {
         if (regionDef && !matchesWaterBodyRegion(wb, regionDef.id)) return false;
@@ -1186,14 +1237,23 @@ async function startServer() {
       return res.json({ items: localMatches, source: 'hydro-index' });
     }
 
-    const cacheKey = `${text}:${regionId}:${majorOnly}`;
+    const biasLat = req.query.lat !== undefined ? Number(req.query.lat) : undefined;
+    const biasLng = req.query.lng !== undefined ? Number(req.query.lng) : undefined;
+    const validBias =
+      typeof biasLat === 'number' &&
+      typeof biasLng === 'number' &&
+      Number.isFinite(biasLat) &&
+      Number.isFinite(biasLng);
+
+    const cacheKey = `${text}:${regionId}:${majorOnly}:${validBias ? `${biasLat.toFixed(1)},${biasLng.toFixed(1)}` : 'global'}`;
     const cached = geocodeCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
-      const merged = [...localMatches, ...cached.items.filter((r) => !localMatches.some((l) => l.title === r.title))].slice(0, 10);
-      return res.json({ items: merged, source: cached.items.length > 0 ? 'hydro+osm' : 'hydro-index' });
+      const merged = [...localMatches, ...cached.items.filter((r) => !localMatches.some((l) => l.title === r.title))].slice(0, 12);
+      return res.json({ items: merged, source: cached.items.length > 0 ? 'hydro+osm+gmaps' : 'hydro-index', google_places_quota_exceeded: false });
     }
 
     const remoteItems: typeof localMatches = [];
+    let googlePlacesQuotaExceeded = false;
     try {
       const fetchPhoton = async (url: string) => {
         const controller = new AbortController();
@@ -1256,14 +1316,20 @@ async function startServer() {
       const searchTerm = strippedText.length >= 2 ? strippedText : normalizedRaw;
       const encodedPrimary = encodeURIComponent(searchTerm);
       const encodedFull = encodeURIComponent(normalizedRaw);
-      const [waterFeatures, generalFeatures, nomPrimary, nomFull] = await Promise.all([
+      const [waterFeatures, generalFeatures, nomPrimary, nomFull, googlePlacesSearch] = await Promise.all([
         fetchPhoton(
           `https://photon.komoot.io/api/?q=${encodedPrimary}&limit=8&osm_tag=water&osm_tag=waterway:river&osm_tag=waterway:canal&osm_tag=waterway:dam&osm_tag=waterway:weir&osm_tag=natural:water`
         ).catch(() => []),
         fetchPhoton(`https://photon.komoot.io/api/?q=${encodedFull}&limit=6`).catch(() => []),
         fetchNominatim(normalizedRaw),
         searchTerm !== normalizedRaw ? fetchNominatim(searchTerm) : Promise.resolve([]),
+        searchWaterBodiesViaGooglePlaces({
+          query: normalizedRaw,
+          lat: validBias ? biasLat : undefined,
+          lng: validBias ? biasLng : undefined,
+        }),
       ]);
+      googlePlacesQuotaExceeded = googlePlacesSearch.quotaExceeded;
 
       const nonWaterOsmKeys = new Set([
         'highway',
@@ -1371,14 +1437,40 @@ async function startServer() {
           water_type: waterType,
         });
       }
+      for (const gItem of googlePlacesSearch.items) {
+        const duplicateExisting = remoteItems.some(
+          (r) =>
+            r.title.toLowerCase() === gItem.title.toLowerCase() &&
+            haversineMeters({ lat: r.lat, lng: r.lng }, { lat: gItem.lat, lng: gItem.lng }) < 2500
+        );
+        if (duplicateExisting) continue;
+        remoteItems.push({
+          id: gItem.id,
+          title: gItem.title,
+          subtitle: gItem.subtitle,
+          lat: gItem.lat,
+          lng: gItem.lng,
+          water_body_id: null,
+          is_water_body: gItem.is_water_body,
+          water_type: gItem.water_type,
+          google_maps_uri: gItem.google_maps_uri,
+          provider: 'google_places',
+        });
+      }
       remoteItems.sort((a, b) => Number(Boolean(b.is_water_body)) - Number(Boolean(a.is_water_body)));
     } catch {
-      // Keep local matches if OSM geocoders are offline
+      // Keep local matches if OSM/Google geocoders are offline
     }
 
-    geocodeCache.set(cacheKey, { expiresAt: Date.now() + 15 * 60 * 1000, items: remoteItems });
-    const merged = [...localMatches, ...remoteItems.filter((r) => !localMatches.some((l) => l.title === r.title))].slice(0, 10);
-    return res.json({ items: merged, source: remoteItems.length > 0 ? 'hydro+osm' : 'hydro-index' });
+    if (!googlePlacesQuotaExceeded) {
+      geocodeCache.set(cacheKey, { expiresAt: Date.now() + 15 * 60 * 1000, items: remoteItems });
+    }
+    const merged = [...localMatches, ...remoteItems.filter((r) => !localMatches.some((l) => l.title === r.title))].slice(0, 12);
+    return res.json({
+      items: merged,
+      source: remoteItems.length > 0 ? 'hydro+osm+gmaps' : 'hydro-index',
+      google_places_quota_exceeded: googlePlacesQuotaExceeded,
+    });
   });
 
   // --- Fish photo recognition (FR-10) ---
