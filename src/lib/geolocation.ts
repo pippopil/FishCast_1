@@ -1,3 +1,4 @@
+import { Geolocation as CapacitorGeolocation } from '@capacitor/geolocation';
 import { isCapacitorNative } from './apiClient';
 import { haversineMeters, pointInWaterBody } from './fishLogic';
 import type { LatLng, WaterBody } from './types';
@@ -137,7 +138,6 @@ function nearestPointOnSegment(
   a: [number, number],
   b: [number, number]
 ): { coords: LatLng; distance_m: number } {
-  // Local equirectangular projection around p for accurate short-distance projection
   const cosLat = Math.cos((p.lat * Math.PI) / 180);
   const ax = (a[0] - p.lng) * cosLat;
   const ay = a[1] - p.lat;
@@ -229,23 +229,6 @@ export function getGpsHttpWarning(): string | null {
   return 'Сайт открыт по незащищённому HTTP — браузер может блокировать точный GPS. Откройте по HTTPS или в Android-приложении.';
 }
 
-interface CapacitorGeolocationPlugin {
-  requestPermissions?: () => Promise<{ location?: string; coarseLocation?: string }>;
-  getCurrentPosition?: (options?: {
-    enableHighAccuracy?: boolean;
-    timeout?: number;
-    maximumAge?: number;
-  }) => Promise<{ coords: { latitude: number; longitude: number; accuracy?: number } }>;
-}
-
-function getCapacitorGeolocationPlugin(): CapacitorGeolocationPlugin | null {
-  if (typeof window === 'undefined') return null;
-  const win = window as unknown as {
-    Capacitor?: { Plugins?: { Geolocation?: CapacitorGeolocationPlugin } };
-  };
-  return win.Capacitor?.Plugins?.Geolocation ?? null;
-}
-
 function loadSavedGpsRecord(): { coords: LatLng; accuracy_m: number | null; ts: number } | null {
   if (typeof window === 'undefined') return null;
   try {
@@ -303,62 +286,335 @@ export function isMobileDeviceContext(): boolean {
   return /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
 }
 
+export type LocationPermissionState = 'granted' | 'prompt' | 'denied' | 'unsupported';
+
+export type GeolocationErrorCode =
+  | 'permission_denied'
+  | 'position_unavailable'
+  | 'timeout'
+  | 'insecure_context'
+  | 'unsupported';
+
+export interface GeolocationAttemptResult {
+  fix: GeolocationFix | null;
+  errorCode?: GeolocationErrorCode;
+  errorTitle?: string;
+  errorDetail?: string;
+  permissionState: LocationPermissionState;
+}
+
+export function describeGeolocationError(code: GeolocationErrorCode): { title: string; detail: string } {
+  switch (code) {
+    case 'permission_denied':
+      return {
+        title: 'Доступ к геолокации запрещён',
+        detail:
+          'Разрешите доступ к местоположению для «Клёвый прогноз» в настройках устройства или браузера, затем нажмите «Повторить».',
+      };
+    case 'position_unavailable':
+      return {
+        title: 'Не удалось определить координаты',
+        detail:
+          'Службы геолокации отключены или отсутствует сигнал спутников/сети. Включите GPS (высокая точность) на устройстве и выйдите на открытое место.',
+      };
+    case 'timeout':
+      return {
+        title: 'Превышено время ожидания GPS',
+        detail:
+          'Устройство не успело получить координаты от спутников. Попробуйте снова на открытом воздухе или включите определение по Wi‑Fi и мобильной сети.',
+      };
+    case 'insecure_context':
+      return {
+        title: 'Геолокация заблокирована на HTTP',
+        detail:
+          'Браузер ограничивает точный GPS на незащищённом соединении. Откройте приложение по HTTPS или используйте Android-приложение.',
+      };
+    case 'unsupported':
+    default:
+      return {
+        title: 'Геолокация не поддерживается',
+        detail: 'На этом устройстве или в текущем браузере отсутствует поддержка API геолокации.',
+      };
+  }
+}
+
 /**
- * Resolves the user's real GPS position across Capacitor Android/iOS native WebViews
- * and mobile/desktop browsers. Supports optional 5-minute TTL caching to conserve battery,
- * strict high-accuracy GPS (`maximumAge: 0`, `timeout: 10000`) on explicit requests,
- * and automatic coarse fallback indoors.
+ * Explicitly checks the current location permission status before starting
+ * any GPS / triangulation flow (works in both Capacitor Android/iOS and Web).
  */
-export async function detectUserLocation(options?: {
+export async function checkLocationPermission(): Promise<LocationPermissionState> {
+  if (isCapacitorNative()) {
+    try {
+      const perms = await CapacitorGeolocation.checkPermissions();
+      if (perms.location === 'granted' || perms.coarseLocation === 'granted') {
+        return 'granted';
+      }
+      if (perms.location === 'denied' && (!perms.coarseLocation || perms.coarseLocation === 'denied')) {
+        return 'denied';
+      }
+      return 'prompt';
+    } catch {
+      return 'prompt';
+    }
+  }
+
+  if (typeof navigator === 'undefined' || !navigator.geolocation) {
+    return 'unsupported';
+  }
+
+  if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+    try {
+      const status = await navigator.permissions.query({ name: 'geolocation' as PermissionName });
+      if (status.state === 'granted' || status.state === 'denied' || status.state === 'prompt') {
+        return status.state;
+      }
+    } catch {
+      // Safari / older WebViews may not support permissions.query('geolocation')
+    }
+  }
+
+  return 'prompt';
+}
+
+/**
+ * Explicitly checks and, on native Capacitor devices, requests location permission
+ * before initializing position triangulation.
+ */
+export async function ensureLocationPermission(): Promise<LocationPermissionState> {
+  const current = await checkLocationPermission();
+  if (current === 'granted' || current === 'unsupported') {
+    return current;
+  }
+
+  if (isCapacitorNative()) {
+    try {
+      const req = await CapacitorGeolocation.requestPermissions();
+      if (req.location === 'granted' || req.coarseLocation === 'granted') {
+        return 'granted';
+      }
+      return 'denied';
+    } catch {
+      return current;
+    }
+  }
+
+  return current;
+}
+
+function classifyNativeGeolocationError(err: unknown): GeolocationErrorCode {
+  const msg = String((err as { message?: string })?.message ?? err ?? '').toLowerCase();
+  if (msg.includes('denied') || msg.includes('permission') || msg.includes('not authorized')) {
+    return 'permission_denied';
+  }
+  if (msg.includes('timeout') || msg.includes('timed out')) {
+    return 'timeout';
+  }
+  return 'position_unavailable';
+}
+
+async function resolveNativeCapacitorLocation(
+  highAccuracy: boolean,
+  timeoutMs: number,
+  forceFresh: boolean
+): Promise<{ fix: GeolocationFix | null; errorCode?: GeolocationErrorCode }> {
+  if (!isCapacitorNative()) return { fix: null, errorCode: 'unsupported' };
+
+  const formatPos = (pos: { coords?: { latitude: number; longitude: number; accuracy?: number } } | null): GeolocationFix | null => {
+    if (!pos?.coords) return null;
+    if (!Number.isFinite(pos.coords.latitude) || !Number.isFinite(pos.coords.longitude)) return null;
+    const coords: LatLng = {
+      lat: Number(pos.coords.latitude.toFixed(5)),
+      lng: Number(pos.coords.longitude.toFixed(5)),
+    };
+    const accuracy_m =
+      typeof pos.coords.accuracy === 'number' && Number.isFinite(pos.coords.accuracy)
+        ? Math.round(pos.coords.accuracy)
+        : null;
+    saveGpsOrigin(coords, accuracy_m);
+    return {
+      coords,
+      accuracy_m,
+      source: 'capacitor',
+      timestamp: Date.now(),
+    };
+  };
+
+  let lastError: GeolocationErrorCode = 'position_unavailable';
+
+  // Step 1: High-accuracy FusedLocation / GPS fix
+  try {
+    const pos = await CapacitorGeolocation.getCurrentPosition({
+      enableHighAccuracy: highAccuracy,
+      timeout: Math.max(timeoutMs, 10000),
+      maximumAge: forceFresh ? 0 : 30_000,
+    });
+    const fix = formatPos(pos);
+    if (fix) return { fix };
+  } catch (err) {
+    lastError = classifyNativeGeolocationError(err);
+    if (lastError === 'permission_denied') {
+      return { fix: null, errorCode: 'permission_denied' };
+    }
+  }
+
+  // Step 2: Fast network/Wi-Fi/cell FusedLocation (essential indoors or before cold GPS lock)
+  try {
+    const pos = await CapacitorGeolocation.getCurrentPosition({
+      enableHighAccuracy: false,
+      timeout: 10000,
+      maximumAge: 120_000,
+    });
+    const fix = formatPos(pos);
+    if (fix) return { fix };
+  } catch (err) {
+    const errCode = classifyNativeGeolocationError(err);
+    if (errCode === 'permission_denied') {
+      return { fix: null, errorCode: 'permission_denied' };
+    }
+    lastError = errCode;
+  }
+
+  // Step 3: Single-shot watchPosition fallback for Android devices with empty last-known location cache
+  try {
+    const watchResult = await new Promise<{ fix: GeolocationFix | null; errorCode?: GeolocationErrorCode }>((resolve) => {
+      let settled = false;
+      let watchId: string | null = null;
+      const done = (val: { fix: GeolocationFix | null; errorCode?: GeolocationErrorCode }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (watchId !== null) {
+          void CapacitorGeolocation.clearWatch({ id: watchId }).catch(() => undefined);
+        }
+        resolve(val);
+      };
+      const timer = setTimeout(() => done({ fix: null, errorCode: 'timeout' }), 8000);
+      void CapacitorGeolocation.watchPosition(
+        { enableHighAccuracy: false, timeout: 8000, maximumAge: 60_000 },
+        (pos, err) => {
+          if (err) {
+            const code = classifyNativeGeolocationError(err);
+            if (code === 'permission_denied') done({ fix: null, errorCode: code });
+            return;
+          }
+          if (!pos) return;
+          const fix = formatPos(pos);
+          if (fix) done({ fix });
+        }
+      )
+        .then((id) => {
+          watchId = id;
+          if (settled) {
+            void CapacitorGeolocation.clearWatch({ id }).catch(() => undefined);
+          }
+        })
+        .catch((err) => done({ fix: null, errorCode: classifyNativeGeolocationError(err) }));
+    });
+    if (watchResult.fix) return watchResult;
+    return { fix: null, errorCode: watchResult.errorCode ?? lastError };
+  } catch (err) {
+    return { fix: null, errorCode: classifyNativeGeolocationError(err) };
+  }
+}
+
+/**
+ * Resolves the user's real GPS position with explicit pre-check of permissions
+ * and descriptive error classification across Capacitor native and Web browsers.
+ */
+export async function detectUserLocationDetailed(options?: {
   highAccuracy?: boolean;
   timeoutMs?: number;
   forceFresh?: boolean;
   useCache?: boolean;
   cacheTtlMs?: number;
-}): Promise<GeolocationFix | null> {
+  requestPermission?: boolean;
+}): Promise<GeolocationAttemptResult> {
   const highAccuracy = options?.highAccuracy ?? true;
-  const timeoutMs = options?.timeoutMs ?? 10000;
+  const timeoutMs = options?.timeoutMs ?? 12000;
   const forceFresh = options?.forceFresh ?? false;
   const cacheTtlMs = options?.cacheTtlMs ?? DEFAULT_GPS_CACHE_TTL_MS;
+  const requestPermission = options?.requestPermission ?? true;
+
+  if (isInsecureHttpContext()) {
+    const desc = describeGeolocationError('insecure_context');
+    return {
+      fix: null,
+      errorCode: 'insecure_context',
+      errorTitle: desc.title,
+      errorDetail: desc.detail,
+      permissionState: 'denied',
+    };
+  }
+
+  // Explicit permission check before initializing GPS triangulation
+  const permState = requestPermission
+    ? await ensureLocationPermission()
+    : await checkLocationPermission();
+
+  if (permState === 'unsupported') {
+    const desc = describeGeolocationError('unsupported');
+    return {
+      fix: null,
+      errorCode: 'unsupported',
+      errorTitle: desc.title,
+      errorDetail: desc.detail,
+      permissionState: 'unsupported',
+    };
+  }
+
+  if (permState === 'denied') {
+    const desc = describeGeolocationError('permission_denied');
+    return {
+      fix: null,
+      errorCode: 'permission_denied',
+      errorTitle: desc.title,
+      errorDetail: desc.detail,
+      permissionState: 'denied',
+    };
+  }
 
   if (options?.useCache && !forceFresh) {
     const saved = loadSavedGpsRecord();
     if (saved && saved.ts > 0 && Date.now() - saved.ts <= cacheTtlMs) {
       return {
-        coords: saved.coords,
-        accuracy_m: saved.accuracy_m,
-        source: 'cached',
-        timestamp: saved.ts,
+        fix: {
+          coords: saved.coords,
+          accuracy_m: saved.accuracy_m,
+          source: 'cached',
+          timestamp: saved.ts,
+        },
+        permissionState: permState,
       };
     }
   }
 
-  // 1. Native Capacitor Geolocation plugin if present
-  const capGeo = getCapacitorGeolocationPlugin();
-  if (capGeo?.getCurrentPosition) {
-    try {
-      await capGeo.requestPermissions?.();
-      const pos = await capGeo.getCurrentPosition({
-        enableHighAccuracy: highAccuracy,
-        timeout: timeoutMs,
-        maximumAge: forceFresh ? 0 : 60_000,
-      });
-      if (pos?.coords) {
-        const coords: LatLng = {
-          lat: Number(pos.coords.latitude.toFixed(5)),
-          lng: Number(pos.coords.longitude.toFixed(5)),
-        };
-        const accuracy_m = typeof pos.coords.accuracy === 'number' ? Math.round(pos.coords.accuracy) : null;
-        saveGpsOrigin(coords, accuracy_m);
-        return {
-          coords,
-          accuracy_m,
-          source: 'capacitor',
-          timestamp: Date.now(),
-        };
-      }
-    } catch {
-      // Fall through to standard WebView navigator.geolocation
+  // 1. Native Capacitor Geolocation plugin (Android FusedLocation / iOS CoreLocation)
+  if (isCapacitorNative()) {
+    const nativeAttempt = await resolveNativeCapacitorLocation(highAccuracy, timeoutMs, forceFresh);
+    if (nativeAttempt.fix) {
+      return { fix: nativeAttempt.fix, permissionState: 'granted' };
+    }
+    const errCode = nativeAttempt.errorCode ?? 'position_unavailable';
+    if (errCode === 'permission_denied') {
+      const desc = describeGeolocationError('permission_denied');
+      return {
+        fix: null,
+        errorCode: 'permission_denied',
+        errorTitle: desc.title,
+        errorDetail: desc.detail,
+        permissionState: 'denied',
+      };
+    }
+    // Fall through to WebView Geolocation only if not explicitly denied
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      const desc = describeGeolocationError(errCode);
+      return {
+        fix: null,
+        errorCode: errCode,
+        errorTitle: desc.title,
+        errorDetail: desc.detail,
+        permissionState: permState,
+      };
     }
   }
 
@@ -390,19 +646,66 @@ export async function detectUserLocation(options?: {
         );
       });
 
+    const mapBrowserErr = (err: unknown): GeolocationErrorCode => {
+      const code = (err as { code?: number })?.code;
+      if (code === 1) return 'permission_denied';
+      if (code === 3) return 'timeout';
+      return 'position_unavailable';
+    };
+
     try {
-      return await requestBrowserPos(highAccuracy, timeoutMs, forceFresh ? 0 : 60_000);
-    } catch {
+      const fix = await requestBrowserPos(highAccuracy, timeoutMs, forceFresh ? 0 : 60_000);
+      return { fix, permissionState: 'granted' };
+    } catch (firstErr) {
+      const firstCode = mapBrowserErr(firstErr);
+      if (firstCode === 'permission_denied') {
+        const desc = describeGeolocationError('permission_denied');
+        return {
+          fix: null,
+          errorCode: 'permission_denied',
+          errorTitle: desc.title,
+          errorDetail: desc.detail,
+          permissionState: 'denied',
+        };
+      }
       // Fallback to coarse/network fix when GPS satellites aren't locked indoors
-      if (highAccuracy) {
-        try {
-          return await requestBrowserPos(false, 5000, 120_000);
-        } catch {
-          // Denied or unavailable
-        }
+      try {
+        const fix = await requestBrowserPos(false, 8000, 180_000);
+        return { fix, permissionState: 'granted' };
+      } catch (secondErr) {
+        const finalCode = mapBrowserErr(secondErr);
+        const desc = describeGeolocationError(finalCode);
+        return {
+          fix: null,
+          errorCode: finalCode,
+          errorTitle: desc.title,
+          errorDetail: desc.detail,
+          permissionState: finalCode === 'permission_denied' ? 'denied' : permState,
+        };
       }
     }
   }
 
-  return null;
+  const desc = describeGeolocationError('unsupported');
+  return {
+    fix: null,
+    errorCode: 'unsupported',
+    errorTitle: desc.title,
+    errorDetail: desc.detail,
+    permissionState: 'unsupported',
+  };
+}
+
+/**
+ * Backwards-compatible helper returning only the GeolocationFix or null.
+ */
+export async function detectUserLocation(options?: {
+  highAccuracy?: boolean;
+  timeoutMs?: number;
+  forceFresh?: boolean;
+  useCache?: boolean;
+  cacheTtlMs?: number;
+}): Promise<GeolocationFix | null> {
+  const attempt = await detectUserLocationDetailed(options);
+  return attempt.fix;
 }

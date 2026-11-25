@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronUp, Filter, Search, WifiOff } from 'lucide-react';
+import { AlertTriangle, ChevronUp, Filter, RefreshCw, Search, WifiOff, X } from 'lucide-react';
 import { FishMap, type HistoricMapOverlay, type MapLayerToggles } from './components/FishMap';
 import { TopNav, type AppTab } from './components/TopNav';
 import { WaterBodySheet } from './components/WaterBodySheet';
@@ -16,6 +16,9 @@ import {
   buildFallbackWeather,
   discoverOsmWaterBodiesDirect,
   fetchOpenMeteoWeatherDirect,
+  getApiBaseUrl,
+  isCapacitorNative,
+  searchWaterBodiesDirect,
 } from './lib/apiClient';
 import {
   analyzeWaterBody,
@@ -35,12 +38,16 @@ import {
 } from './lib/fishLogic';
 import {
   GPSFilter,
-  detectUserLocation,
-  getGpsHttpWarning,
+  checkLocationPermission,
+  describeGeolocationError,
+  detectUserLocationDetailed,
+  ensureLocationPermission,
   isMobileDeviceContext,
   loadSavedGpsOrigin,
   saveGpsOrigin,
+  type GeolocationErrorCode,
 } from './lib/geolocation';
+import { assessCrayfishPresence } from './data/crayfishData';
 import {
   filterWaterBodiesByRegionAndScale,
   getRegionById,
@@ -159,6 +166,7 @@ export default function App() {
     baseStyle: 'scheme',
     contours: true,
     heatmap: true,
+    fishActivityHeatmap: true,
     prospective: true,
     openSeaMap: false,
     topoOverlay: false,
@@ -175,6 +183,14 @@ export default function App() {
   const [goodBiteMobileOpen, setGoodBiteMobileOpen] = useState(false);
   const [userOrigin, setUserOrigin] = useState<LatLng>(() => loadSavedGpsOrigin() ?? DEFAULT_ORIGIN);
   const [usingRealGps, setUsingRealGps] = useState<boolean>(() => Boolean(loadSavedGpsOrigin()));
+  const [locatingGps, setLocatingGps] = useState(false);
+  const [syncingQueue, setSyncingQueue] = useState(false);
+  const [locationError, setLocationError] = useState<{
+    code: GeolocationErrorCode;
+    title: string;
+    detail: string;
+  } | null>(null);
+  const [referenceSection, setReferenceSection] = useState<'species' | 'crayfish' | 'knots'>('species');
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
   // Favorites, PWA Bite Alerts & Offline Map Regions
@@ -300,6 +316,29 @@ export default function App() {
           setSelectedWaterBody((prev) => prev ?? wbs[0]);
         }
         return;
+      }
+
+      // Stale-While-Revalidate for speciesList: serve IndexedDB cache immediately and force-revalidate on stable connection
+      const fetchFreshSpecies = async (): Promise<FishSpecies[]> => {
+        const res = await fetch(apiUrl('/api/v1/species'));
+        if (!res.ok) throw new Error('Species fetch failed');
+        const json = (await res.json()) as { species?: FishSpecies[] };
+        return Array.isArray(json.species) ? json.species : [];
+      };
+
+      const swrSpecies = await offlineDb.getSpeciesListSWR({
+        fetcher: fetchFreshSpecies,
+        fallback: SEED_SPECIES,
+        isOnline,
+        forceRevalidate: isOnline,
+        onRevalidated: (fresh) => {
+          if (active && fresh.length > 0) {
+            setSpeciesList(fresh);
+          }
+        },
+      });
+      if (active && swrSpecies.species.length > 0) {
+        setSpeciesList(swrSpecies.species);
       }
 
       try {
@@ -621,35 +660,42 @@ export default function App() {
     };
   }, [selectedWaterBody?.id, selectedFishId, isOnline, reports.length]);
 
-  // Auto-flush IndexedDB sync_queue when connectivity returns
+  // Auto-flush IndexedDB sync_queue when connectivity returns (also callable via Sync Now button)
   const flushSyncQueue = useCallback(async () => {
     if (!isOnline) return;
     const items = await offlineDb.getQueue();
     if (items.length === 0) return;
 
-    for (const item of items) {
-      try {
-        if (item.entity_type === 'report_create') {
-          const res = await fetch('/api/v1/reports', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(item.payload),
-          });
-          if (res.ok) {
-            const json = (await res.json()) as { report: CatchReport };
-            handleIncomingReport(json.report);
-            await offlineDb.removeQueueItem(item.local_id);
+    setSyncingQueue(true);
+    try {
+      for (const item of items) {
+        try {
+          if (item.entity_type === 'report_create') {
+            const res = await fetch(apiUrl('/api/v1/reports'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(item.payload),
+            });
+            if (res.ok) {
+              const json = (await res.json()) as { report: CatchReport };
+              handleIncomingReport(json.report);
+              await offlineDb.removeQueueItem(item.local_id);
+            }
           }
+        } catch {
+          await offlineDb.updateQueueItem({ ...item, retry_count: item.retry_count + 1 });
         }
-      } catch {
-        await offlineDb.updateQueueItem({ ...item, retry_count: item.retry_count + 1 });
       }
-    }
 
-    const remaining = await offlineDb.getQueue();
-    setSyncQueue(remaining);
-    if (remaining.length === 0) {
-      showToast('Офлайн-записи успешно синхронизированы с сервером.');
+      const remaining = await offlineDb.getQueue();
+      setSyncQueue(remaining);
+      if (remaining.length === 0) {
+        showToast('Офлайн-записи успешно синхронизированы с сервером.');
+      } else {
+        showToast(`В очереди осталось ${remaining.length} зап. — повторим при стабильном соединении.`);
+      }
+    } finally {
+      setSyncingQueue(false);
     }
   }, [isOnline, handleIncomingReport, showToast]);
 
@@ -972,35 +1018,84 @@ export default function App() {
 
   const handleSearchChange = async (text: string) => {
     setSearchQuery(text);
-    if (text.trim().length < 2) {
+    const trimmed = text.trim();
+    if (trimmed.length < 2) {
       setSearchResults([]);
       return;
     }
+    const normalized = trimmed.replace(/платин/gi, 'плотин').toLowerCase();
+    const stopWords = new Set(['в', 'на', 'у', 'под', 'г', 'город', 'городе', 'с', 'село', 'селе', 'р', 'река', 'озеро']);
+    const tokens = normalized
+      .replace(/[.,()«»"']/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 2 && !stopWords.has(t));
+
+    const localMatches = waterBodies
+      .filter((w) => {
+        const hay = `${w.name ?? ''} ${w.display_label} ${w.region ?? ''}`.toLowerCase();
+        if (hay.includes(normalized)) return true;
+        if (tokens.length > 0) {
+          return tokens.every((t) => {
+            const stem = t.length >= 5 ? t.slice(0, t.length - 1) : t;
+            return hay.includes(t) || hay.includes(stem);
+          });
+        }
+        return false;
+      })
+      .slice(0, 6)
+      .map((w) => ({
+        id: w.id,
+        title: w.display_label,
+        subtitle: `${w.region} · ${w.area_ha} га`,
+        water_body_id: w.id,
+        lat: w.center.lat,
+        lng: w.center.lng,
+        is_water_body: true,
+        water_type: w.type,
+      }));
+
     if (!isOnline) {
-      const local = waterBodies
-        .filter((w) => w.display_label.toLowerCase().includes(text.trim().toLowerCase()))
-        .slice(0, 6)
-        .map((w) => ({
-          id: w.id,
-          title: w.display_label,
-          subtitle: `${w.region} · ${w.area_ha} га`,
-          water_body_id: w.id,
-        }));
-      setSearchResults(local);
+      setSearchResults(localMatches);
       return;
     }
+
+    // In standalone Capacitor APK without external backend URL, search directly via Nominatim + Photon
+    if (isCapacitorNative() && !getApiBaseUrl()) {
+      try {
+        const directItems = await searchWaterBodiesDirect(trimmed, waterBodies, userOrigin);
+        setSearchResults(directItems.length > 0 ? directItems : localMatches);
+      } catch {
+        setSearchResults(localMatches);
+      }
+      return;
+    }
+
     try {
+      // Do not restrict explicit name search to selectedRegionId / majorOnly so rivers like "река Сейм" are always found
       const qs = new URLSearchParams({
-        text,
+        text: trimmed,
         kind: 'hydro',
-        region_id: selectedRegionId,
-        major_only: String(majorOnly),
+        region_id: 'all',
+        major_only: 'false',
       });
       const res = await fetch(apiUrl(`/api/v1/geocode/search?${qs.toString()}`));
-      const json = (await res.json()) as { items?: typeof searchResults };
-      setSearchResults(json.items ?? []);
+      if (res.ok) {
+        const json = (await res.json()) as { items?: typeof searchResults };
+        if (Array.isArray(json.items) && json.items.length > 0) {
+          setSearchResults(json.items);
+          return;
+        }
+      }
+      // Fallback to direct Nominatim + Photon if backend returned empty or error
+      const directItems = await searchWaterBodiesDirect(trimmed, waterBodies, userOrigin);
+      setSearchResults(directItems.length > 0 ? directItems : localMatches);
     } catch {
-      setSearchResults([]);
+      try {
+        const directItems = await searchWaterBodiesDirect(trimmed, waterBodies, userOrigin);
+        setSearchResults(directItems.length > 0 ? directItems : localMatches);
+      } catch {
+        setSearchResults(localMatches);
+      }
     }
   };
 
@@ -1445,11 +1540,19 @@ export default function App() {
             void offlineDb.saveWaterBodies(merged);
             return merged;
           });
+          // Ensure newly discovered local/regional water bodies are immediately visible on the map
+          if (params.region_id === 'all') {
+            setSelectedRegionId((prev) => (prev !== 'all' ? 'all' : prev));
+          }
+          if (params.major_only === false) {
+            setMajorOnly((prev) => (prev ? false : prev));
+          }
         }
 
         if (selectedHit) {
           handleSelectWaterBody(selectedHit);
-          if (!params.silent) showToast(`Открыт водоём из OSM: ${selectedHit.display_label}`);
+          const cf = assessCrayfishPresence(selectedHit);
+          if (!params.silent) showToast(`Открыт водоём из OSM: ${selectedHit.display_label} · ${cf.shortLabel}`);
         } else if (params.autoSelectNearest && incoming.length > 0) {
           const sorted = [...incoming].sort(
             (a, b) =>
@@ -1457,8 +1560,11 @@ export default function App() {
               haversineMeters({ lat: params.lat, lng: params.lng }, b.center)
           );
           setSelectedWaterBody(sorted[0]);
+          const cf = assessCrayfishPresence(sorted[0]);
           if (!params.silent) {
-            showToast(`Найдено рядом с вами (OSM): ${incoming.length} водоём(ов). Открыт: ${sorted[0].display_label}`);
+            showToast(
+              `Найдено рядом (OSM): ${incoming.length} водоём(ов). Открыт: ${sorted[0].display_label} · ${cf.compactBadge}`
+            );
           }
         } else if (!params.silent) {
           if (incoming.length > 0) {
@@ -1473,7 +1579,34 @@ export default function App() {
         }
       };
 
+      const runDirectFallback = async () => {
+        const directList = await discoverOsmWaterBodiesDirect({
+          lat: params.lat,
+          lng: params.lng,
+          radiusKm: params.radius_km ?? 20,
+          query: params.query ?? params.select_title,
+          majorOnly: params.major_only,
+        });
+        let selectedHit: WaterBody | null = null;
+        const targetTitle = (params.select_title ?? params.query ?? '').trim().toLowerCase();
+        if (targetTitle.length >= 2 && directList.length > 0) {
+          const strippedTarget = targetTitle
+            .replace(/^(?:река|речка|р\.|озеро|оз\.|водохранилище|вдхр\.?|пруд|карьер|канал)\s+/i, '')
+            .trim();
+          selectedHit =
+            directList.find((w) => {
+              const lbl = w.display_label.toLowerCase();
+              return lbl.includes(targetTitle) || (strippedTarget.length >= 2 && lbl.includes(strippedTarget));
+            }) ?? directList[0];
+        }
+        mergeDiscovered(directList, selectedHit, directList.length);
+      };
+
       try {
+        if (isCapacitorNative() && !getApiBaseUrl()) {
+          await runDirectFallback();
+          return;
+        }
         const res = await fetch(apiUrl('/api/v1/water-bodies/discover'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1489,6 +1622,10 @@ export default function App() {
             select_region: params.select_region,
           }),
         });
+        if (!res.ok) {
+          await runDirectFallback();
+          return;
+        }
         const json = (await res.json()) as {
           discovered?: WaterBody[];
           items?: WaterBody[];
@@ -1496,24 +1633,17 @@ export default function App() {
           selected?: WaterBody | null;
           error?: string;
         };
-        if (!res.ok) {
-          if (!params.silent) showToast(json.error ?? 'Не удалось загрузить водоёмы из OSM.');
-          return;
-        }
 
         const incoming = [...(json.discovered ?? json.items ?? []), ...(json.selected ? [json.selected] : [])];
+        if (incoming.length === 0 && (params.query || params.select_title)) {
+          await runDirectFallback();
+          return;
+        }
         mergeDiscovered(incoming, json.selected ?? null, json.added_count);
       } catch {
-        // Standalone Capacitor APK fallback: direct Photon OSM reverse/search discovery
+        // Standalone Capacitor APK or offline backend fallback: direct Nominatim + Overpass + Photon discovery
         try {
-          const directList = await discoverOsmWaterBodiesDirect({
-            lat: params.lat,
-            lng: params.lng,
-            radiusKm: params.radius_km ?? 20,
-            query: params.query ?? params.select_title,
-            majorOnly: params.major_only,
-          });
-          mergeDiscovered(directList, null, directList.length);
+          await runDirectFallback();
         } catch {
           if (!params.silent) showToast('Ошибка сети при обращении к OpenStreetMap.');
         }
@@ -1583,31 +1713,67 @@ export default function App() {
 
   const handleLocateUser = useCallback(() => {
     void (async () => {
-      const fix = await detectUserLocation({ highAccuracy: true, timeoutMs: 10000, forceFresh: true });
-      if (!fix) {
-        const httpWarn = getGpsHttpWarning();
-        showToast(httpWarn ?? 'Нет доступа к GPS — расчёт ведётся от базовой точки.');
-        return;
-      }
-      const filtered = gpsFilterRef.current.addPoint({
-        lat: fix.coords.lat,
-        lng: fix.coords.lng,
-        accuracy_m: fix.accuracy_m,
-        timestamp: fix.timestamp,
-      });
-      await applyLocatedOrigin(filtered.coords, {
-        forceDiscover: true,
-        silentToast: fix.accuracy_m !== null,
-      });
-      if (fix.accuracy_m !== null) {
-        showToast(
-          `GPS обновлён (±${fix.accuracy_m} м)${filtered.smoothed ? ' · сглажен дрейф' : ''}.`
-        );
+      setLocatingGps(true);
+      try {
+        // Explicitly check location permission before initializing triangulation
+        const initialPerm = await checkLocationPermission();
+        if (initialPerm === 'unsupported') {
+          const desc = describeGeolocationError('unsupported');
+          setLocationError({ code: 'unsupported', title: desc.title, detail: desc.detail });
+          showToast(desc.title);
+          return;
+        }
+
+        const resolvedPerm =
+          initialPerm === 'granted' ? 'granted' : await ensureLocationPermission();
+        if (resolvedPerm === 'denied') {
+          const desc = describeGeolocationError('permission_denied');
+          setLocationError({ code: 'permission_denied', title: desc.title, detail: desc.detail });
+          showToast(desc.title);
+          return;
+        }
+
+        const attempt = await detectUserLocationDetailed({
+          highAccuracy: true,
+          timeoutMs: 12000,
+          forceFresh: true,
+          requestPermission: false,
+        });
+
+        if (!attempt.fix) {
+          const code = attempt.errorCode ?? 'position_unavailable';
+          const fallbackDesc = describeGeolocationError(code);
+          const title = attempt.errorTitle ?? fallbackDesc.title;
+          const detail = attempt.errorDetail ?? fallbackDesc.detail;
+          setLocationError({ code, title, detail });
+          showToast(title);
+          return;
+        }
+
+        setLocationError(null);
+        const fix = attempt.fix;
+        const filtered = gpsFilterRef.current.addPoint({
+          lat: fix.coords.lat,
+          lng: fix.coords.lng,
+          accuracy_m: fix.accuracy_m,
+          timestamp: fix.timestamp,
+        });
+        await applyLocatedOrigin(filtered.coords, {
+          forceDiscover: true,
+          silentToast: fix.accuracy_m !== null,
+        });
+        if (fix.accuracy_m !== null) {
+          showToast(
+            `GPS обновлён (±${fix.accuracy_m} м)${filtered.smoothed ? ' · сглажен дрейф' : ''}.`
+          );
+        }
+      } finally {
+        setLocatingGps(false);
       }
     })();
   }, [applyLocatedOrigin, showToast]);
 
-  // Mobile / Capacitor startup: automatically locate user GPS point (reuses 5-min cache to save battery)
+  // Mobile / Capacitor startup: explicitly check permission first, then locate user GPS point
   useEffect(() => {
     if (mobileGpsBootstrappedRef.current) return;
     if (!isMobileDeviceContext()) return;
@@ -1615,8 +1781,43 @@ export default function App() {
 
     let active = true;
     void (async () => {
-      const fix = await detectUserLocation({ highAccuracy: true, useCache: true, cacheTtlMs: 300_000 });
-      if (!active || !fix) return;
+      const perm = await checkLocationPermission();
+      if (!active) return;
+      if (perm === 'unsupported') return;
+      if (perm === 'denied') {
+        const desc = describeGeolocationError('permission_denied');
+        setLocationError({ code: 'permission_denied', title: desc.title, detail: desc.detail });
+        return;
+      }
+
+      const resolvedPerm = perm === 'granted' ? 'granted' : await ensureLocationPermission();
+      if (!active) return;
+      if (resolvedPerm === 'denied') {
+        const desc = describeGeolocationError('permission_denied');
+        setLocationError({ code: 'permission_denied', title: desc.title, detail: desc.detail });
+        return;
+      }
+
+      const attempt = await detectUserLocationDetailed({
+        highAccuracy: true,
+        useCache: true,
+        cacheTtlMs: 300_000,
+        requestPermission: false,
+      });
+      if (!active) return;
+      if (!attempt.fix) {
+        if (attempt.errorCode) {
+          const desc = describeGeolocationError(attempt.errorCode);
+          setLocationError({
+            code: attempt.errorCode,
+            title: attempt.errorTitle ?? desc.title,
+            detail: attempt.errorDetail ?? desc.detail,
+          });
+        }
+        return;
+      }
+      setLocationError(null);
+      const fix = attempt.fix;
       const filtered = gpsFilterRef.current.addPoint({
         lat: fix.coords.lat,
         lng: fix.coords.lng,
@@ -1806,7 +2007,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#F4F7F9] text-slate-900 dark:bg-slate-950 dark:text-slate-100 flex flex-col">
+    <div className="min-h-dvh w-full max-w-full overflow-x-hidden bg-[#F4F7F9] text-slate-900 dark:bg-slate-950 dark:text-slate-100 flex flex-col">
       <TopNav
         activeTab={activeTab}
         onSelectTab={setActiveTab}
@@ -1814,6 +2015,8 @@ export default function App() {
         isOnline={isOnline}
         wsConnected={wsConnected}
         pendingSyncCount={syncQueue.length}
+        syncingQueue={syncingQueue}
+        onSyncNow={() => void flushSyncQueue()}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode((d) => !d)}
       />
@@ -1826,10 +2029,50 @@ export default function App() {
         </div>
       )}
 
+      {/* Descriptive Location Error Banner */}
+      {locationError && (
+        <div
+          role="alert"
+          data-testid="location-error-banner"
+          className="border-b border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/50 dark:text-rose-100"
+        >
+          <div className="mx-auto flex max-w-[1600px] items-start justify-between gap-2.5">
+            <div className="flex min-w-0 items-start gap-2">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" aria-hidden="true" />
+              <div className="min-w-0">
+                <div className="font-bold">{locationError.title}</div>
+                <p className="mt-0.5 text-[11px] leading-snug text-rose-800 dark:text-rose-200">
+                  {locationError.detail}
+                </p>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <button
+                type="button"
+                disabled={locatingGps}
+                onClick={handleLocateUser}
+                className="inline-flex min-h-[30px] items-center gap-1 rounded-lg bg-rose-700 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-rose-800 disabled:opacity-60"
+              >
+                <RefreshCw className={`h-3 w-3 ${locatingGps ? 'animate-spin' : ''}`} aria-hidden="true" />
+                <span>{locatingGps ? 'Поиск...' : 'Повторить'}</span>
+              </button>
+              <button
+                type="button"
+                aria-label="Скрыть предупреждение о геолокации"
+                onClick={() => setLocationError(null)}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-rose-700 hover:bg-rose-100 dark:text-rose-300 dark:hover:bg-rose-900/50"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main Content */}
-      <main className="flex-1 flex flex-col">
+      <main className="flex-1 flex flex-col min-w-0">
         {activeTab === 'map' && (
-          <div className="relative flex flex-col lg:flex-row h-[calc(100dvh-117px)] lg:h-[calc(100dvh-57px)] overflow-hidden">
+          <div className="relative flex flex-col lg:flex-row h-[calc(100dvh-114px-env(safe-area-inset-bottom,0px))] lg:h-[calc(100dvh-57px)] overflow-hidden">
             {/* Map Canvas Column */}
             <div className="relative flex-1 h-full">
               {/* Top-Center / Right Map Search & Live Filter Overlay */}
@@ -1984,8 +2227,8 @@ export default function App() {
                     lat: center.lat,
                     lng: center.lng,
                     radius_km: 16,
-                    region_id: selectedRegionId,
-                    major_only: majorOnly,
+                    region_id: 'all',
+                    major_only: false,
                   })
                 }
                 discoveringOsm={discoveringOsm}
@@ -2024,26 +2267,41 @@ export default function App() {
                 onToggleMajorOnly={setMajorOnly}
               />
 
-              {/* Mobile Compact Selected Water Body Bar */}
-              {selectedWaterBody && !mobileSheetOpen && (
-                <div className="lg:hidden fixed bottom-16 left-0 right-0 z-20 p-3 pointer-events-none">
-                  <button
-                    type="button"
-                    onClick={() => setMobileSheetOpen(true)}
-                    className="pointer-events-auto flex w-full items-center justify-between rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-left shadow-lg backdrop-blur dark:border-slate-700 dark:bg-slate-900/95"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-bold text-slate-900 dark:text-white">
-                        {selectedWaterBody.display_label}
+              {/* Mobile Compact Selected Water Body Bottom Toolbar Container */}
+              {selectedWaterBody && !mobileSheetOpen && (() => {
+                const mobileCrayfish = assessCrayfishPresence(selectedWaterBody);
+                return (
+                  <div className="lg:hidden fixed bottom-16 left-0 right-0 z-20 px-3 pt-2 pb-safe pointer-events-none">
+                    <button
+                      type="button"
+                      onClick={() => setMobileSheetOpen(true)}
+                      className="pointer-events-auto mb-2 flex w-full items-center justify-between gap-2 rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-left shadow-lg backdrop-blur dark:border-slate-700 dark:bg-slate-900/95"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-bold text-slate-900 dark:text-white">
+                          {selectedWaterBody.display_label}
+                        </div>
+                        <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-xs text-slate-500 dark:text-slate-400">
+                          <span>Прогноз, глубины и маршрут</span>
+                          <span aria-hidden="true">·</span>
+                          <span
+                            className={
+                              mobileCrayfish.level === 'high'
+                                ? 'font-semibold text-teal-700 dark:text-teal-400'
+                                : mobileCrayfish.level === 'medium'
+                                  ? 'font-semibold text-amber-700 dark:text-amber-400'
+                                  : 'text-slate-500 dark:text-slate-400'
+                            }
+                          >
+                            {mobileCrayfish.compactBadge}
+                          </span>
+                        </div>
                       </div>
-                      <div className="text-xs text-slate-500">
-                        Прогноз, батиметрия и маршрут до берега
-                      </div>
-                    </div>
-                    <ChevronUp className="h-5 w-5 shrink-0 text-sky-700" aria-hidden="true" />
-                  </button>
-                </div>
-              )}
+                      <ChevronUp className="h-5 w-5 shrink-0 text-sky-700" aria-hidden="true" />
+                    </button>
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Desktop Right Detail Inspector */}
@@ -2088,6 +2346,10 @@ export default function App() {
                   onOpenAlerts={() => setAlertsModalOpen(true)}
                   isOnline={isOnline}
                   onVerifySpecies={handleVerifySpecies}
+                  onOpenCrayfishGuide={() => {
+                    setReferenceSection('crayfish');
+                    setActiveTab('reference');
+                  }}
                 />
               </aside>
             )}
@@ -2095,7 +2357,7 @@ export default function App() {
             {/* Mobile Expanded Bottom Sheet */}
             {selectedWaterBody && mobileSheetOpen && (
               <div className="lg:hidden fixed inset-0 z-50 flex flex-col justify-end bg-slate-950/50 backdrop-blur-xs">
-                <div className="h-[85vh] overflow-hidden rounded-t-3xl bg-white shadow-2xl dark:bg-slate-900">
+                <div className="h-[85dvh] overflow-hidden rounded-t-3xl bg-white shadow-2xl dark:bg-slate-900 pb-safe">
                   <WaterBodySheet
                     waterBody={selectedWaterBody}
                     weather={weather}
@@ -2142,6 +2404,11 @@ export default function App() {
                     }}
                     isOnline={isOnline}
                     onVerifySpecies={handleVerifySpecies}
+                    onOpenCrayfishGuide={() => {
+                      setMobileSheetOpen(false);
+                      setReferenceSection('crayfish');
+                      setActiveTab('reference');
+                    }}
                   />
                 </div>
               </div>
@@ -2193,6 +2460,24 @@ export default function App() {
             knotsCacheMeta={knotsCacheMeta}
             isOnline={isOnline}
             onRefreshKnotsCache={handleRefreshKnotsCache}
+            initialSection={referenceSection}
+            onLocateCrayfishSpot={(spot) => {
+              setActiveTab('map');
+              setMapFocusPoint({ lat: spot.coords.lat, lng: spot.coords.lng, zoom: 11, ts: Date.now() });
+              if (isOnline) {
+                showToast(`Открываем на карте: ${spot.name} (${spot.region})...`);
+                void handleDiscoverOsmWaterBodies({
+                  lat: spot.coords.lat,
+                  lng: spot.coords.lng,
+                  radius_km: 15,
+                  query: spot.name,
+                  select_title: spot.name,
+                  autoSelectNearest: true,
+                });
+              } else {
+                showToast(`Переход к точке «${spot.name}» на карте.`);
+              }
+            }}
           />
         )}
 
@@ -2208,6 +2493,16 @@ export default function App() {
             onToggleManualOffline={setManualOffline}
             syncQueue={syncQueue}
             onFlushSyncQueue={() => void flushSyncQueue()}
+            offlineRegions={offlineRegions}
+            selectedRegionId={selectedRegionId}
+            onDownloadOfflineRegion={handleDownloadOfflineRegion}
+            onDeleteOfflineRegion={handleDeleteOfflineRegion}
+            onFocusOfflineRegion={(reg) => {
+              const centerLat = (reg.bbox.north + reg.bbox.south) / 2;
+              const centerLng = (reg.bbox.east + reg.bbox.west) / 2;
+              setMapFocusPoint({ lat: centerLat, lng: centerLng, zoom: 11, ts: Date.now() });
+              setActiveTab('map');
+            }}
             onCreateDiaryEntry={(p) => submitReportOrQueue({ ...p, source: 'diary' })}
             onDeleteReport={handleDeleteReport}
             onAuthLogin={handleAuthLogin}
@@ -2254,7 +2549,7 @@ export default function App() {
       {toastMsg && (
         <div
           role="status"
-          className="fixed bottom-24 left-3 z-50 max-w-sm rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-semibold text-white shadow-lg dark:bg-sky-700 lg:bottom-20 lg:left-3"
+          className="fixed bottom-[calc(5.25rem+env(safe-area-inset-bottom,0px))] left-3 z-50 max-w-sm rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-semibold text-white shadow-lg dark:bg-sky-700 lg:bottom-20 lg:left-3"
         >
           {toastMsg}
         </div>

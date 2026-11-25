@@ -12,6 +12,18 @@ export interface PresetMapRegion {
 
 export const PRESET_MAP_REGIONS: PresetMapRegion[] = [
   {
+    id: 'region-kursk-seym-lgov',
+    name: 'Курская обл.: р. Сейм, Льгов и Сугрово',
+    description: 'Река Сейм, Городское озеро в г. Льгов и плотина в с. Сугрово',
+    bbox: { north: 51.74, south: 51.57, east: 35.42, west: 35.18 },
+  },
+  {
+    id: 'region-kursk-city',
+    name: 'Курск, р. Сейм и Курчатовское вдхр.',
+    description: 'Курское водохранилище, река Сейм и акватория Курчатова',
+    bbox: { north: 51.84, south: 51.58, east: 36.36, west: 35.62 },
+  },
+  {
     id: 'region-istra',
     name: 'Истринское вдхр. и р. Истра',
     description: 'Истринское вдхр., Бужарово, Лучинское и плёсы р. Истра',
@@ -29,7 +41,30 @@ export const PRESET_MAP_REGIONS: PresetMapRegion[] = [
     description: 'Западный каскад водохранилищ и карьеры у д. Сычёво',
     bbox: { north: 56.00, south: 55.52, east: 36.42, west: 35.72 },
   },
+  {
+    id: 'region-oka-serpukhov',
+    name: 'Река Ока (Серпухов — Кашира)',
+    description: 'Русловые ямы, перекаты и затоны р. Ока',
+    bbox: { north: 54.96, south: 54.76, east: 38.18, west: 37.25 },
+  },
 ];
+
+/**
+ * Builds a tile-budget-friendly bounding box centered around any selected catalog region
+ * so OSM tiles at zooms 10–13 cache reliably within the 220-tile limit.
+ */
+export function buildOfflineBboxForRegion(center: LatLng, bbox: MapBbox): MapBbox {
+  const maxHalfLat = 0.22;
+  const maxHalfLng = 0.34;
+  const halfLat = Math.min(maxHalfLat, Math.max(0.08, Math.abs(bbox.north - bbox.south) / 2));
+  const halfLng = Math.min(maxHalfLng, Math.max(0.12, Math.abs(bbox.east - bbox.west) / 2));
+  return {
+    north: Number(Math.min(85, center.lat + halfLat).toFixed(4)),
+    south: Number(Math.max(-85, center.lat - halfLat).toFixed(4)),
+    east: Number(Math.min(180, center.lng + halfLng).toFixed(4)),
+    west: Number(Math.max(-180, center.lng - halfLng).toFixed(4)),
+  };
+}
 
 export interface TileCoord {
   z: number;

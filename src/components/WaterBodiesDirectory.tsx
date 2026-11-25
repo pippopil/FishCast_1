@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Car, Compass, Fish, Footprints, Globe, Loader2, MapPin, Plus, Search, Star, TrendingUp } from 'lucide-react';
 import { getExpectedFishForWaterBody, waterBodyTypeRu } from '../lib/fishLogic';
+import { assessCrayfishPresence } from '../data/crayfishData';
 import { REGIONS_CATALOG, getRegionById } from '../lib/regions';
 import type {
   CatchReport,
@@ -87,11 +88,15 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
       getExpectedFishForWaterBody({ waterBody: item.water_body, speciesList, reports }).some((f) =>
         f.species_name.toLowerCase().includes(q)
       );
+    const crayfishMatches =
+      (q.includes('рак') || q.includes('crayfish')) &&
+      assessCrayfishPresence(item.water_body).level !== 'low';
     return (
       item.water_body.display_label.toLowerCase().includes(q) ||
       waterBodyTypeRu(item.water_body.type).toLowerCase().includes(q) ||
       item.water_body.region.toLowerCase().includes(q) ||
-      fishMatches
+      fishMatches ||
+      crayfishMatches
     );
   });
 
@@ -504,6 +509,30 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
                         <span className="font-semibold text-slate-700 dark:text-slate-200">Рыба:</span> {topNames}
                         {extra}
                       </span>
+                    </p>
+                  );
+                })()}
+
+                {(() => {
+                  const cf = assessCrayfishPresence(wb);
+                  return (
+                    <p className="mt-1 flex items-center gap-1.5 text-xs">
+                      <span
+                        className={`font-semibold ${
+                          cf.level === 'high'
+                            ? 'text-teal-700 dark:text-teal-400'
+                            : cf.level === 'medium'
+                              ? 'text-amber-700 dark:text-amber-400'
+                              : 'text-slate-500 dark:text-slate-400'
+                        }`}
+                      >
+                        {cf.shortLabel}
+                      </span>
+                      {cf.level !== 'low' && (
+                        <span className="text-slate-500 dark:text-slate-400">
+                          · сезон: {cf.bestSeason}
+                        </span>
+                      )}
                     </p>
                   );
                 })()}

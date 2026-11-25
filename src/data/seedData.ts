@@ -8,7 +8,7 @@ import type {
   WaterBodyInhabitingSpecies,
 } from '../lib/types';
 
-export const SEED_DATA_VERSION = 5;
+export const SEED_DATA_VERSION = 7;
 
 const RAW_SEED_WATER_BODIES: WaterBody[] = [
   {
@@ -8959,6 +8959,125 @@ const RAW_SEED_WATER_BODIES: WaterBody[] = [
         ]
       }
     ]
+  },
+  {
+    "id": "wb-seym-lgov",
+    "name": "Река Сейм (Льгов — Сугрово)",
+    "display_label": "Река Сейм (Льгов — Сугрово)",
+    "type": "river",
+    "center": {
+      "lat": 51.6518,
+      "lng": 35.291
+    },
+    "polygon": [
+      [35.268, 51.662],
+      [35.28, 51.657],
+      [35.292, 51.6535],
+      [35.305, 51.648],
+      [35.318, 51.641],
+      [35.315, 51.638],
+      [35.302, 51.645],
+      [35.29, 51.65],
+      [35.277, 51.654],
+      [35.265, 51.659],
+      [35.268, 51.662]
+    ],
+    "area_ha": 145,
+    "source": "osm",
+    "confidence": 0.96,
+    "moderation_status": "verified",
+    "connected_to": null,
+    "has_bathymetry": true,
+    "max_depth_m": 6.2,
+    "avg_depth_m": 2.8,
+    "depth_source": "catalog",
+    "region": "Курская область · Льговский район",
+    "external_id": "OSM-R169484",
+    "ndwi_stability": "year_round",
+    "vegetation_index": "moderate",
+    "water_clarity": "moderate",
+    "target_zone": {
+      "lat": 51.6518,
+      "lng": 35.291
+    }
+  },
+  {
+    "id": "wb-lgov-city-lake",
+    "name": "Городское озеро (г. Льгов)",
+    "display_label": "Городское озеро (г. Льгов)",
+    "type": "lake",
+    "center": {
+      "lat": 51.6665,
+      "lng": 35.2635
+    },
+    "polygon": [
+      [35.268, 51.6665],
+      [35.2667, 51.6685],
+      [35.2635, 51.6693],
+      [35.2603, 51.6685],
+      [35.259, 51.6665],
+      [35.2603, 51.6645],
+      [35.2635, 51.6637],
+      [35.2667, 51.6645],
+      [35.268, 51.6665]
+    ],
+    "area_ha": 18,
+    "source": "osm",
+    "confidence": 0.94,
+    "moderation_status": "verified",
+    "connected_to": "wb-seym-lgov",
+    "has_bathymetry": false,
+    "max_depth_m": 4.5,
+    "avg_depth_m": 2.1,
+    "depth_source": "estimated",
+    "region": "Курская область · г. Льгов",
+    "external_id": "OSM-LGOV-LAKE",
+    "ndwi_stability": "year_round",
+    "vegetation_index": "moderate",
+    "water_clarity": "moderate",
+    "target_zone": {
+      "lat": 51.6668,
+      "lng": 35.264
+    }
+  },
+  {
+    "id": "wb-sugrovo-dam",
+    "name": "Плотина в Сугрове (с. Сугрово, р. Сейм)",
+    "display_label": "Плотина в Сугрове (с. Сугрово, р. Сейм)",
+    "type": "reservoir",
+    "center": {
+      "lat": 51.6358,
+      "lng": 35.3235
+    },
+    "polygon": [
+      [35.3285, 51.6358],
+      [35.327, 51.638],
+      [35.3235, 51.6388],
+      [35.32, 51.638],
+      [35.3185, 51.6358],
+      [35.32, 51.6336],
+      [35.3235, 51.6328],
+      [35.327, 51.6336],
+      [35.3285, 51.6358]
+    ],
+    "area_ha": 28,
+    "source": "osm",
+    "confidence": 0.94,
+    "moderation_status": "verified",
+    "connected_to": "wb-seym-lgov",
+    "has_bathymetry": false,
+    "max_depth_m": 5.8,
+    "avg_depth_m": 2.6,
+    "depth_source": "estimated",
+    "region": "Курская область · Льговский район, с. Сугрово",
+    "external_id": "OSM-SUGROVO-DAM",
+    "ndwi_stability": "year_round",
+    "vegetation_index": "moderate",
+    "water_clarity": "moderate",
+    "target_zone": {
+      "lat": 51.6362,
+      "lng": 35.3242
+    }
   }
 ];
 
@@ -9143,6 +9262,33 @@ const WATER_BODY_ICHTHYOFAUNA: Record<string, WaterBodyInhabitingSpecies[]> = {
     { species_id: 'som', abundance: 'regular', note: 'Глубокие волжские ямы летом' },
     { species_id: 'nalim', abundance: 'regular', note: 'Твёрдые бровки в холодное время года' },
     { species_id: 'krasnoperka', abundance: 'regular', note: 'Заросшие заливы и мелководные протоки' },
+  ],
+  'wb-seym-lgov': [
+    { species_id: 'golavl', abundance: 'common', note: 'Быстрые перекаты и нависшие ветви вдоль течения р. Сейм' },
+    { species_id: 'pike', abundance: 'common', note: 'Омуты, старицы и границы прибрежной травы' },
+    { species_id: 'lesh', abundance: 'common', note: 'Русловые ямы 3,5–6 м на фидер и донку' },
+    { species_id: 'okun', abundance: 'common', note: 'Бровки, коряжники и обратки на плёсах' },
+    { species_id: 'plotva', abundance: 'common', note: 'Повсеместно на умеренном течении и плёсах' },
+    { species_id: 'sudak', abundance: 'regular', note: 'Твёрдые песчано-глинистые бровки и глубинные ямы' },
+    { species_id: 'yaz', abundance: 'regular', note: 'Выходы с перекатов и подмытые берега' },
+    { species_id: 'som', abundance: 'rare', note: 'Глубокие русловые омуты в тёплый сезон' },
+  ],
+  'wb-lgov-city-lake': [
+    { species_id: 'karas', abundance: 'common', note: 'Окна в траве и прибрежные бровки утром' },
+    { species_id: 'plotva', abundance: 'common', note: 'Повсеместно вдоль кромки камыша на поплавок' },
+    { species_id: 'okun', abundance: 'common', note: 'Охотится у береговых свалов и водной растительности' },
+    { species_id: 'pike', abundance: 'regular', note: 'Заросшие мелководья и выходы из ямок' },
+    { species_id: 'lin', abundance: 'regular', note: 'Тихие заросшие участки с илистым дном летом' },
+    { species_id: 'krasnoperka', abundance: 'regular', note: 'Верхние слои воды у кувшинок и тростника' },
+  ],
+  'wb-sugrovo-dam': [
+    { species_id: 'golavl', abundance: 'common', note: 'На струе и обратках ниже плотины в с. Сугрово' },
+    { species_id: 'okun', abundance: 'common', note: 'Каменные насыпи, опоры и свалы у плотины' },
+    { species_id: 'pike', abundance: 'common', note: 'Тихие карманы, обратки и граница струи' },
+    { species_id: 'lesh', abundance: 'common', note: 'Глубокие приямки выше и ниже плотины на фидер' },
+    { species_id: 'plotva', abundance: 'common', note: 'Спокойные плёсы и границы течения' },
+    { species_id: 'sudak', abundance: 'regular', note: 'Кислородная струя и твёрдое дно на сумерках' },
+    { species_id: 'karas', abundance: 'regular', note: 'Верхний бьеф и тихие заливы у камыша' },
   ],
 };
 
@@ -9514,6 +9660,42 @@ export const SEED_ACCESS_POINTS: WaterBodyAccessPoint[] = [
     "unpaved": false,
     "driving_reachable": true,
     "notes": "Спуск и парковка на берегу Иваньковского водохранилища"
+  },
+  {
+    "id": "ap-seym-lgov",
+    "water_body_id": "wb-seym-lgov",
+    "lat": 51.6565,
+    "lng": 35.291,
+    "type": "parking",
+    "source": "osm",
+    "confidence": 0.92,
+    "unpaved": false,
+    "driving_reachable": true,
+    "notes": "Удобный подъезд к берегу р. Сейм со стороны г. Льгов"
+  },
+  {
+    "id": "ap-lgov-city-lake",
+    "water_body_id": "wb-lgov-city-lake",
+    "lat": 51.6708,
+    "lng": 35.2635,
+    "type": "parking",
+    "source": "osm",
+    "confidence": 0.92,
+    "unpaved": false,
+    "driving_reachable": true,
+    "notes": "Городской подъезд и береговая зона Городского озера в г. Льгов"
+  },
+  {
+    "id": "ap-sugrovo-dam",
+    "water_body_id": "wb-sugrovo-dam",
+    "lat": 51.6402,
+    "lng": 35.3235,
+    "type": "parking",
+    "source": "osm",
+    "confidence": 0.92,
+    "unpaved": true,
+    "driving_reachable": true,
+    "notes": "Подъезд к плотине и берегу р. Сейм в с. Сугрово"
   }
 ];
 
@@ -10234,6 +10416,18 @@ export const SEED_REPORTS: CatchReport[] = [
     bait: 'Виброхвост 12 см, груз 14 г',
     retrieve: 'Ступенька по бровке 6→9 м',
     weather_summary: '762 мм рт. ст. · +5°C · ЮЗ 3.5 м/с',
+    weather_snapshot: {
+      pressure_hpa: 1016,
+      pressure_trend: 'steady',
+      pressure_delta_6h: 0.4,
+      water_temp_c: 6.2,
+      air_temp_c: 5.0,
+      wind_speed_ms: 3.5,
+      wind_direction_label: 'ЮЗ',
+      cloud_cover_pct: 68,
+      precipitation_mm: 0,
+      hour_local: 6,
+    },
     photo_url: 'sample:pike',
     notes: 'Взяла на паузе у руслового свала на рассвете, отпущена после фото.',
     visibility: 'public',
@@ -10258,6 +10452,18 @@ export const SEED_REPORTS: CatchReport[] = [
     bait: 'Микроджиг 4 г + машинное масло 2.2″',
     retrieve: 'Волочение по каменистому свалу',
     weather_summary: '761 мм рт. ст. · +4°C · ЮЗ 3 м/с',
+    weather_snapshot: {
+      pressure_hpa: 1015,
+      pressure_trend: 'steady',
+      pressure_delta_6h: -0.2,
+      water_temp_c: 5.4,
+      air_temp_c: 4.0,
+      wind_speed_ms: 3.0,
+      wind_direction_label: 'ЮЗ',
+      cloud_cover_pct: 72,
+      precipitation_mm: 0,
+      hour_local: 11,
+    },
     photo_url: 'sample:perch',
     notes: 'Стайный окунь стоит на глубине 4–5 метров, поклёвки аккуратные.',
     visibility: 'public',
@@ -10282,6 +10488,18 @@ export const SEED_REPORTS: CatchReport[] = [
     bait: 'Поролоновая рыбка 9 см, 16 г',
     retrieve: 'Короткий подрыв у коряги',
     weather_summary: '760 мм рт. ст. · +3°C · СЗ 4 м/с',
+    weather_snapshot: {
+      pressure_hpa: 1013,
+      pressure_trend: 'falling',
+      pressure_delta_6h: -0.6,
+      water_temp_c: 4.8,
+      air_temp_c: 3.0,
+      wind_speed_ms: 4.0,
+      wind_direction_label: 'СЗ',
+      cloud_cover_pct: 80,
+      precipitation_mm: 0.2,
+      hour_local: 19,
+    },
     photo_url: 'sample:zander',
     notes: 'Выход в сумерках на глубине 8.5 м.',
     visibility: 'public',
@@ -10306,6 +10524,18 @@ export const SEED_REPORTS: CatchReport[] = [
     bait: 'Червь навозный',
     retrieve: 'Поплавок у камыша',
     weather_summary: '763 мм рт. ст. · +7°C · тихо',
+    weather_snapshot: {
+      pressure_hpa: 1017,
+      pressure_trend: 'rising',
+      pressure_delta_6h: 0.5,
+      water_temp_c: 8.1,
+      air_temp_c: 7.0,
+      wind_speed_ms: 1.4,
+      wind_direction_label: 'Ю',
+      cloud_cover_pct: 35,
+      precipitation_mm: 0,
+      hour_local: 8,
+    },
     photo_url: null,
     notes: 'Пара карасей в окне травы утром.',
     visibility: 'public',

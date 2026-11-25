@@ -983,8 +983,12 @@ export function inferWaterBodyTypeFromOsm(
   if (
     water === 'reservoir' ||
     landuse === 'reservoir' ||
+    waterway === 'dam' ||
+    waterway === 'weir' ||
     lower.includes('водохранилище') ||
-    lower.includes('вдхр')
+    lower.includes('вдхр') ||
+    lower.includes('плотин') ||
+    lower.includes('платин')
   ) {
     return 'reservoir';
   }
@@ -1666,8 +1670,14 @@ async function fetchNominatimSearch(queryText: string): Promise<NominatimLookupI
   }
 }
 
-async function fetchOverpassMetadata(lat: number, lng: number, radiusM: number): Promise<OverpassElement[]> {
-  // Fast tags+center+bb query (includes RELATIONS for reservoirs, large lakes, canals, and major rivers!)
+async function fetchOverpassMetadata(
+  lat: number,
+  lng: number,
+  radiusM: number,
+  majorOnly = false
+): Promise<OverpassElement[]> {
+  // Fast tags+center+bb query (includes RELATIONS for reservoirs, large lakes, canals, major rivers, plus dams & local lakes)
+  const localRadiusM = Math.min(7000, radiusM);
   const qlLines = [
     '[out:json][timeout:5];',
     '(',
@@ -1676,9 +1686,15 @@ async function fetchOverpassMetadata(lat: number, lng: number, radiusM: number):
     `  relation["landuse"="reservoir"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
     `  relation["waterway"~"^(river|canal)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
     `  way["natural"="water"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
-    `  way["waterway"~"^(river|canal)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    `  way["waterway"~"^(river|canal|dam|weir)$"]["name"](around:${radiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+    ...(majorOnly
+      ? []
+      : [
+          `  way["natural"="water"](around:${localRadiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+          `  way["waterway"~"^(dam|weir)$"](around:${localRadiusM},${lat.toFixed(4)},${lng.toFixed(4)});`,
+        ]),
     ');',
-    'out tags center bb 70;',
+    'out tags center bb 80;',
   ];
   const body = `data=${encodeURIComponent(qlLines.join('\n'))}`;
   const endpoints = [
@@ -1729,39 +1745,48 @@ export async function discoverOsmWaterBodies(params: {
   const radiusKm = Math.max(6, Math.min(maxRadius, Math.round(params.radiusKm ?? (regionDef ? 28 : 16))));
   const wideRadiusKm = Math.min(regionDef ? 55 : 35, radiusKm + 14);
   const cleanQuery = (params.queryText ?? '').replace(/["\\[\]]/g, '').trim();
+  const strippedQuery = cleanQuery
+    .replace(/^(?:река|речка|р\.|озеро|оз\.|водохранилище|вдхр\.?|пруд|карьер|канал|старица)\s+/i, '')
+    .trim();
 
   // 1) Fast zero-key Photon OSM discovery:
   //    CRITICAL: Photon indexes major reservoirs & lakes under `osm_tag=water` (NOT `natural:water`)!
-  //    When majorOnly is enabled, focus on reservoirs, large lakes, and canals to avoid minor tributaries.
+  //    Always include `waterway:river` so major rivers (Сейм, Ока, Дон, Десна, etc.) are never missed!
   const photonUrls: string[] = [
     `https://photon.komoot.io/reverse?lat=${params.lat.toFixed(4)}&lon=${params.lng.toFixed(4)}&radius=${wideRadiusKm}&osm_tag=water&limit=25`,
     `https://photon.komoot.io/reverse?lat=${params.lat.toFixed(4)}&lon=${params.lng.toFixed(4)}&radius=${radiusKm}&osm_tag=natural:water&limit=18`,
-    majorOnly
-      ? `https://photon.komoot.io/reverse?lat=${params.lat.toFixed(4)}&lon=${params.lng.toFixed(4)}&radius=${wideRadiusKm}&osm_tag=waterway:canal&osm_tag=water:reservoir&limit=20`
-      : `https://photon.komoot.io/reverse?lat=${params.lat.toFixed(4)}&lon=${params.lng.toFixed(4)}&radius=${wideRadiusKm}&osm_tag=waterway:river&osm_tag=waterway:canal&limit=20`,
+    `https://photon.komoot.io/reverse?lat=${params.lat.toFixed(4)}&lon=${params.lng.toFixed(4)}&radius=${wideRadiusKm}&osm_tag=waterway:river&osm_tag=waterway:canal&limit=20`,
   ];
   if (cleanQuery.length >= 2 && cleanQuery.length <= 60) {
+    const qBase = strippedQuery.length >= 2 ? strippedQuery : cleanQuery;
     const qWithRegion =
-      regionDef && !cleanQuery.toLowerCase().includes(regionDef.shortName.toLowerCase().slice(0, 5))
-        ? `${cleanQuery} ${regionDef.osmQueryHint}`
-        : cleanQuery;
+      regionDef && !qBase.toLowerCase().includes(regionDef.shortName.toLowerCase().slice(0, 5))
+        ? `${qBase} ${regionDef.osmQueryHint}`
+        : qBase;
     photonUrls.push(
       `https://photon.komoot.io/api/?q=${encodeURIComponent(qWithRegion)}&lat=${params.lat.toFixed(4)}&lon=${params.lng.toFixed(4)}&osm_tag=water&osm_tag=waterway&osm_tag=natural:water&limit=12`
     );
+    if (qWithRegion !== qBase) {
+      photonUrls.push(
+        `https://photon.komoot.io/api/?q=${encodeURIComponent(qBase)}&osm_tag=water&osm_tag=waterway&osm_tag=natural:water&limit=10`
+      );
+    }
   } else if (regionDef) {
     photonUrls.push(
       `https://photon.komoot.io/api/?q=${encodeURIComponent(`водохранилище ${regionDef.osmQueryHint}`)}&lat=${regionDef.center.lat.toFixed(4)}&lon=${regionDef.center.lng.toFixed(4)}&osm_tag=water&limit=15`
     );
   }
 
-  // Targeted Nominatim searches: explicit query + featured major reservoirs of the selected region
+  // Targeted Nominatim searches: explicit query (both original and stripped prefix) + featured major reservoirs
   const nominatimQueries: string[] = [];
   if (cleanQuery.length >= 2) {
-    nominatimQueries.push(
-      regionDef && !cleanQuery.toLowerCase().includes(regionDef.shortName.toLowerCase().slice(0, 5))
-        ? `${cleanQuery}, ${regionDef.osmQueryHint}`
-        : cleanQuery
-    );
+    nominatimQueries.push(cleanQuery);
+    if (strippedQuery.length >= 2 && strippedQuery !== cleanQuery) {
+      nominatimQueries.push(strippedQuery);
+    }
+    if (regionDef && !cleanQuery.toLowerCase().includes(regionDef.shortName.toLowerCase().slice(0, 5))) {
+      nominatimQueries.push(`${cleanQuery}, ${regionDef.osmQueryHint}`);
+    }
   } else if (regionDef) {
     nominatimQueries.push(...(regionDef.featuredQueries ?? []).slice(0, majorOnly ? 4 : 2));
   }
@@ -1770,7 +1795,7 @@ export async function discoverOsmWaterBodies(params: {
   const radiusM = Math.min(25000, radiusKm * 1000);
   const [photonBatches, overpassElements, nominatimSearchBatches] = await Promise.all([
     Promise.all(photonUrls.map((u) => fetchPhotonFeatures(u))),
-    fetchOverpassMetadata(params.lat, params.lng, radiusM),
+    fetchOverpassMetadata(params.lat, params.lng, radiusM, majorOnly),
     Promise.all(nominatimQueries.map((q) => fetchNominatimSearch(q))),
   ]);
   const nominatimSearchItems = nominatimSearchBatches.flat();
@@ -1863,8 +1888,27 @@ export async function discoverOsmWaterBodies(params: {
 
   // Overpass hits enriched with Nominatim multipolygons/linestrings
   for (const el of overpassElements) {
-    const rawName = el.tags?.name?.trim();
-    if (!rawName) continue;
+    const isDamOrWeir = el.tags?.waterway === 'dam' || el.tags?.waterway === 'weir';
+    let rawName = el.tags?.name?.trim() || '';
+    if (!rawName) {
+      if (majorOnly) continue;
+      // Include unnamed local lakes, ponds, and dams when discovering nearby water bodies
+      const cLatTmp = el.center?.lat ?? (el.bounds ? (el.bounds.minlat + el.bounds.maxlat) / 2 : undefined);
+      const cLngTmp = el.center?.lon ?? (el.bounds ? (el.bounds.minlon + el.bounds.maxlon) / 2 : undefined);
+      if (typeof cLatTmp !== 'number' || typeof cLngTmp !== 'number') continue;
+      if (isDamOrWeir) {
+        rawName = `Плотина (${cLatTmp.toFixed(3)}, ${cLngTmp.toFixed(3)})`;
+      } else if (el.bounds) {
+        const dLatKm = Math.abs(el.bounds.maxlat - el.bounds.minlat) * 111;
+        const dLngKm = Math.abs(el.bounds.maxlon - el.bounds.minlon) * 111 * Math.cos((cLatTmp * Math.PI) / 180);
+        const estHa = dLatKm * dLngKm * 38;
+        if (estHa < 0.8) continue;
+        const kindLabel = el.tags?.water === 'pond' ? 'Пруд' : el.tags?.water === 'reservoir' ? 'Водоём / плотина' : 'Озеро / пруд';
+        rawName = `${kindLabel} (${cLatTmp.toFixed(3)}, ${cLngTmp.toFixed(3)})`;
+      } else {
+        continue;
+      }
+    }
     const prefix = el.type === 'relation' ? 'R' : 'W';
     const osmTagKey = `${prefix}${el.id}`;
     const type = inferWaterBodyTypeFromOsm(el.tags ?? {}, rawName);
@@ -1989,6 +2033,12 @@ export async function discoverOsmWaterBodies(params: {
       return entry;
     })
     .filter((entry) => {
+      const matchesExplicit =
+        cleanQuery.length >= 2 &&
+        (entry.wb.display_label.toLowerCase().includes(cleanQuery.toLowerCase()) ||
+          (strippedQuery.length >= 2 &&
+            entry.wb.display_label.toLowerCase().includes(strippedQuery.toLowerCase())));
+      if (matchesExplicit) return true;
       if (regionDef && !matchesWaterBodyRegion(entry.wb, regionDef.id)) return false;
       if (majorOnly && !isMajorWaterBody(entry.wb)) return false;
       return true;

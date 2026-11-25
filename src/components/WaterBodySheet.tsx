@@ -52,6 +52,7 @@ import {
   type BathymetryProfilePoint,
   type SonarImportPoint,
 } from '../lib/fishLogic';
+import { assessCrayfishPresence } from '../data/crayfishData';
 import type {
   BathymetryPoint,
   BiteForecastResponse,
@@ -112,6 +113,7 @@ interface WaterBodySheetProps {
     abundance?: FishAbundance;
     note?: string;
   }) => Promise<string | null>;
+  onOpenCrayfishGuide?: () => void;
 }
 
 type DetailSubTab = 'forecast' | 'depth' | 'route';
@@ -333,6 +335,7 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
   onOpenAlerts,
   isOnline = true,
   onVerifySpecies,
+  onOpenCrayfishGuide,
 }) => {
   const [subTab, setSubTab] = useState<DetailSubTab>('forecast');
   const [selectedDay, setSelectedDay] = useState<string>('24h');
@@ -365,6 +368,8 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
     () => getExcludedVerifiedSpecies({ waterBody, speciesList, reports }),
     [waterBody, speciesList, reports]
   );
+
+  const crayfishPresence = useMemo(() => assessCrayfishPresence(waterBody), [waterBody]);
 
   const selectedExpectedFish = useMemo(
     () => expectedFish.find((f) => f.species_id === selectedFishId) ?? null,
@@ -610,6 +615,19 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                     </span>
                   </>
                 )}
+              <span aria-hidden="true"> · </span>
+              <span
+                title={crayfishPresence.summary}
+                className={
+                  crayfishPresence.level === 'high'
+                    ? 'font-semibold text-teal-700 dark:text-teal-400'
+                    : crayfishPresence.level === 'medium'
+                      ? 'font-semibold text-amber-700 dark:text-amber-400'
+                      : 'text-slate-500 dark:text-slate-400'
+                }
+              >
+                {crayfishPresence.compactBadge}
+              </span>
             </p>
           </div>
 
@@ -1176,6 +1194,63 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                   </div>
                 </div>
               )}
+
+              {/* Crayfish Presence Assessment */}
+              <div
+                data-testid="water-body-crayfish-presence"
+                className={`mt-3 rounded-xl border p-3 text-xs ${
+                  crayfishPresence.level === 'high'
+                    ? 'border-teal-200 bg-teal-50/70 dark:border-teal-900/60 dark:bg-teal-950/30'
+                    : crayfishPresence.level === 'medium'
+                      ? 'border-amber-200 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/30'
+                      : 'border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-800/60'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="font-bold text-slate-900 dark:text-slate-100">
+                    <span>Наличие раков: </span>
+                    <span
+                      className={
+                        crayfishPresence.level === 'high'
+                          ? 'text-teal-700 dark:text-teal-400'
+                          : crayfishPresence.level === 'medium'
+                            ? 'text-amber-700 dark:text-amber-400'
+                            : 'text-slate-600 dark:text-slate-400'
+                      }
+                    >
+                      {crayfishPresence.confirmedSpot
+                        ? 'обитают (подтверждено базой)'
+                        : crayfishPresence.level === 'high'
+                          ? 'высокая вероятность'
+                          : crayfishPresence.level === 'medium'
+                            ? 'возможны локально'
+                            : 'маловероятны'}
+                    </span>
+                  </div>
+                  <span className="font-mono text-[11px] font-semibold text-slate-500 dark:text-slate-400 tabular-nums">
+                    {crayfishPresence.score}/100
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-700 dark:text-slate-300">
+                  {crayfishPresence.summary}
+                </p>
+                <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-400">
+                  <span>
+                    Сезон: <strong className="text-slate-700 dark:text-slate-200">{crayfishPresence.bestSeason}</strong>
+                    {' · '}
+                    Глубины: <strong className="text-slate-700 dark:text-slate-200">{crayfishPresence.depthHint}</strong>
+                  </span>
+                  {onOpenCrayfishGuide && (
+                    <button
+                      type="button"
+                      onClick={onOpenCrayfishGuide}
+                      className="font-semibold text-sky-700 hover:underline dark:text-sky-400"
+                    >
+                      Как и когда ловить раков →
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
 
             {/* F-Index Bite Forecast (7 Days + Barometric Pressure) */}
@@ -2170,6 +2245,12 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                   <p className="text-slate-600 dark:text-slate-300">
                     Причины: {analysis.reasons.map((r) => r.detail).join(', ')}.
                   </p>
+                  <div className="font-semibold text-slate-900 dark:text-slate-100">
+                    {crayfishPresence.shortLabel}
+                    <span className="ml-2 font-mono text-[11px] font-normal text-slate-500">
+                      ({crayfishPresence.reasons.join(', ')})
+                    </span>
+                  </div>
                   <p className="font-medium text-slate-800 dark:text-slate-200">{analysis.recommendation}</p>
                   <p className="text-[11px] text-slate-500 dark:text-slate-400">{analysis.disclaimer}</p>
                 </div>

@@ -1,5 +1,14 @@
-import React, { useMemo, useState } from 'react';
-import { BookOpen, CheckCircle2, Database, Fish, RefreshCw } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  BookOpen,
+  CheckCircle2,
+  Database,
+  Fish,
+  RefreshCw,
+  Waves,
+} from 'lucide-react';
+import { CRAYFISH_SPOTS, type CrayfishSpot } from '../data/crayfishData';
+import { CrayfishReference } from './CrayfishReference';
 import { recommendLures, waterBodyTypeRu } from '../lib/fishLogic';
 import type { FishSpecies, KnotGuide, WaterBody } from '../lib/types';
 import type { KnotsCacheMeta } from '../utils/offlineDb';
@@ -12,6 +21,8 @@ interface SpeciesReferenceProps {
   knotsCacheMeta?: KnotsCacheMeta | null;
   isOnline?: boolean;
   onRefreshKnotsCache?: () => Promise<void>;
+  onLocateCrayfishSpot?: (spot: CrayfishSpot) => void;
+  initialSection?: 'species' | 'crayfish' | 'knots';
 }
 
 const MONTHS_RU = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
@@ -66,8 +77,13 @@ export const SpeciesReference: React.FC<SpeciesReferenceProps> = ({
   knotsCacheMeta = null,
   isOnline = true,
   onRefreshKnotsCache,
+  onLocateCrayfishSpot,
+  initialSection,
 }) => {
-  const [section, setSection] = useState<'species' | 'knots'>('species');
+  const [section, setSection] = useState<'species' | 'crayfish' | 'knots'>(initialSection ?? 'species');
+  useEffect(() => {
+    if (initialSection) setSection(initialSection);
+  }, [initialSection]);
   const [activeSpeciesId, setActiveSpeciesId] = useState(speciesList[0]?.id ?? 'pike');
   const [contextWbId, setContextWbId] = useState(selectedWaterBody?.id ?? waterBodies[0]?.id ?? '');
   const [knotQuery, setKnotQuery] = useState('');
@@ -96,34 +112,47 @@ export const SpeciesReference: React.FC<SpeciesReferenceProps> = ({
             Справочник рыбака
           </h1>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-            16 видов рыб региона, подбор приманок под глубины водоёма и библиотека узлов — доступно офлайн.
+            Рыба и приманки, база водоёмов и ловля раков, а также библиотека узлов — всё доступно офлайн.
           </p>
         </div>
 
-        <div className="flex items-center gap-1 rounded-xl bg-slate-200/70 p-1 dark:bg-slate-800 self-start">
+        <div className="grid w-full grid-cols-3 gap-1 rounded-xl bg-slate-200/70 p-1 dark:bg-slate-800 sm:flex sm:w-auto sm:items-center">
           <button
             type="button"
             onClick={() => setSection('species')}
-            className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+            className={`inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap sm:px-3.5 ${
               section === 'species'
                 ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
                 : 'text-slate-600 dark:text-slate-400'
             }`}
           >
-            <Fish className="h-4 w-4" aria-hidden="true" />
-            Рыба и приманки ({speciesList.length})
+            <Fish className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span className="truncate">Рыба ({speciesList.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setSection('crayfish')}
+            data-testid="tab-crayfish-guide"
+            className={`inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap sm:px-3.5 ${
+              section === 'crayfish'
+                ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
+                : 'text-slate-600 dark:text-slate-400'
+            }`}
+          >
+            <Waves className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span className="truncate">Раки ({CRAYFISH_SPOTS.length})</span>
           </button>
           <button
             type="button"
             onClick={() => setSection('knots')}
-            className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+            className={`inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap sm:px-3.5 ${
               section === 'knots'
                 ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
                 : 'text-slate-600 dark:text-slate-400'
             }`}
           >
-            <BookOpen className="h-4 w-4" aria-hidden="true" />
-            Узлы и оснастки ({knotsList.length})
+            <BookOpen className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span className="truncate">Узлы ({knotsList.length})</span>
           </button>
         </div>
       </div>
@@ -374,6 +403,10 @@ export const SpeciesReference: React.FC<SpeciesReferenceProps> = ({
             ))}
           </div>
         </div>
+      )}
+
+      {section === 'crayfish' && (
+        <CrayfishReference onLocateCrayfishSpot={onLocateCrayfishSpot} />
       )}
     </div>
   );

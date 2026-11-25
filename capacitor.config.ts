@@ -13,6 +13,8 @@ const config: CapacitorConfig = {
       '*.tile.openstreetmap.org',
       'photon.komoot.io',
       'nominatim.openstreetmap.org',
+      'overpass-api.de',
+      'overpass.kumi.systems',
     ],
   },
   android: {

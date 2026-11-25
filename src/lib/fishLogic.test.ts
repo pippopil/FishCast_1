@@ -2088,7 +2088,258 @@ test('parseOsmWaterTags extracts real max_depth, fishing legality, and Cyrillic/
   assert.equal(allowed.fishing_access, 'allowed');
 });
 
+test('crayfish database includes Seim river, valid coordinates, 12-month calendar, methods, and baits', async () => {
+  const {
+    CRAYFISH_BAITS,
+    CRAYFISH_CALENDAR,
+    CRAYFISH_HABITAT_SIGNS,
+    CRAYFISH_METHODS,
+    CRAYFISH_SPOTS,
+    CRAYFISH_TIMING_AND_RULES,
+  } = await import('../data/crayfishData');
 
+  assert.ok(CRAYFISH_SPOTS.length >= 10, `Expected at least 10 crayfish spots, got ${CRAYFISH_SPOTS.length}`);
+  const seim = CRAYFISH_SPOTS.find((s) => s.name.toLowerCase().includes('сейм'));
+  assert.ok(seim, 'Expected Река Сейм in CRAYFISH_SPOTS');
+  assert.ok(seim.coords.lat > 50 && seim.coords.lat < 53 && seim.coords.lng > 34 && seim.coords.lng < 38);
+
+  for (const spot of CRAYFISH_SPOTS) {
+    assert.ok(spot.coords.lat >= 40 && spot.coords.lat <= 70, `Invalid lat for ${spot.id}`);
+    assert.ok(spot.coords.lng >= 25 && spot.coords.lng <= 140, `Invalid lng for ${spot.id}`);
+    assert.ok(spot.region.length > 0 && spot.bottomType.length > 0 && spot.peakSeason.length > 0);
+  }
+
+  assert.equal(CRAYFISH_CALENDAR.length, 12);
+  const sept = CRAYFISH_CALENDAR.find((m) => m.month === 9);
+  const may = CRAYFISH_CALENDAR.find((m) => m.month === 5);
+  assert.ok(sept && sept.activity >= 85, 'September should be peak crayfish season');
+  assert.ok(may && may.phase === 'Нерест / запрет', 'May should be marked as spawning ban');
+
+  assert.ok(CRAYFISH_HABITAT_SIGNS.length >= 4);
+  assert.ok(CRAYFISH_METHODS.length >= 3);
+  assert.ok(CRAYFISH_BAITS.length >= 4);
+  assert.ok(
+    CRAYFISH_TIMING_AND_RULES.bestTimeOfDay.length > 0 &&
+      CRAYFISH_TIMING_AND_RULES.bestWeather.length > 0 &&
+      CRAYFISH_TIMING_AND_RULES.legalSummary.length > 0
+  );
+});
+
+test('assessCrayfishPresence identifies confirmed crayfish water bodies and scores ecological suitability', async () => {
+  const { assessCrayfishPresence } = await import('../data/crayfishData');
+  const { describeGeolocationError } = await import('./geolocation');
+
+  const seimRiver: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-seym-osm',
+    display_label: 'Река Сейм',
+    type: 'river',
+    center: { lat: 51.69, lng: 36.12 },
+    water_clarity: 'moderate',
+  };
+  const seimRes = assessCrayfishPresence(seimRiver);
+  assert.equal(seimRes.level, 'high');
+  assert.ok(seimRes.confirmedSpot && seimRes.confirmedSpot.id === 'cf-seym');
+  assert.ok(seimRes.shortLabel.includes('Раки'));
+
+  const cleanRiver: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-clean-unknown',
+    display_label: 'Река Прозрачная',
+    type: 'river',
+    center: { lat: 58.5, lng: 42.1 },
+    water_clarity: 'clear',
+    connected_to: 'wb-basin',
+    max_depth_m: 4.0,
+    area_ha: 50,
+  };
+  const cleanRes = assessCrayfishPresence(cleanRiver);
+  assert.equal(cleanRes.level, 'high');
+  assert.equal(cleanRes.confirmedSpot, null);
+
+  const shallowDryPond: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-tiny-mud',
+    display_label: 'Мелкий пруд',
+    type: 'pond',
+    center: { lat: 58.2, lng: 41.9 },
+    connected_to: null,
+    water_clarity: 'murky',
+    max_depth_m: 0.7,
+    area_ha: 0.1,
+    ndwi_stability: 'dries_summer',
+    vegetation_index: 'algal_bloom',
+  };
+  const lowRes = assessCrayfishPresence(shallowDryPond);
+  assert.equal(lowRes.level, 'low');
+  assert.ok(lowRes.shortLabel.includes('маловероятны'));
+
+  const deniedErr = describeGeolocationError('permission_denied');
+  const timeoutErr = describeGeolocationError('timeout');
+  assert.notEqual(deniedErr.title, timeoutErr.title);
+  assert.ok(deniedErr.detail.length > 20 && timeoutErr.detail.length > 20);
+});
+
+test('validatePhotoFileMeta validates MIME types, mobile camera extensions, and file sizes', async () => {
+  const { validatePhotoFileMeta, MAX_PHOTO_RAW_BYTES } = await import('../utils/imageValidation');
+
+  const okJpeg = validatePhotoFileMeta({ name: 'catch.jpg', size: 1200000, type: 'image/jpeg' });
+  assert.equal(okJpeg.ok, true);
+
+  const okCameraNoMime = validatePhotoFileMeta({ name: 'IMG_20261125.jpeg', size: 3500000, type: '' });
+  assert.equal(okCameraNoMime.ok, true);
+  if (okCameraNoMime.ok) assert.equal(okCameraNoMime.normalizedMime, 'image/jpeg');
+
+  const badHeic = validatePhotoFileMeta({ name: 'IMG_001.heic', size: 1500000, type: 'image/heic' });
+  assert.equal(badHeic.ok, false);
+
+  const badPdf = validatePhotoFileMeta({ name: 'doc.pdf', size: 50000, type: 'application/pdf' });
+  assert.equal(badPdf.ok, false);
+
+  const tooBig = validatePhotoFileMeta({ name: 'huge.jpg', size: MAX_PHOTO_RAW_BYTES + 1, type: 'image/jpeg' });
+  assert.equal(tooBig.ok, false);
+
+  const emptyFile = validatePhotoFileMeta({ name: 'empty.png', size: 0, type: 'image/png' });
+  assert.equal(emptyFile.ok, false);
+});
+
+test('Kursk Oblast water bodies (Seym river, Lgov city lake, Sugrovo dam) and offline region presets are registered and searchable', async () => {
+  const { SEED_WATER_BODIES } = await import('../data/seedData');
+  const { PRESET_MAP_REGIONS, buildOfflineBboxForRegion, estimateRegionTileCount } = await import('./offlineMapRegions');
+  const { REGIONS_CATALOG, matchesWaterBodyRegion } = await import('./regions');
+
+  const seym = SEED_WATER_BODIES.find((w) => w.id === 'wb-seym-lgov');
+  const lgovLake = SEED_WATER_BODIES.find((w) => w.id === 'wb-lgov-city-lake');
+  const sugrovoDam = SEED_WATER_BODIES.find((w) => w.id === 'wb-sugrovo-dam');
+
+  assert.ok(seym, 'Река Сейм (Льгов — Сугрово) must exist in SEED_WATER_BODIES');
+  assert.ok(lgovLake, 'Городское озеро (г. Льгов) must exist in SEED_WATER_BODIES');
+  assert.ok(sugrovoDam, 'Плотина в Сугрове must exist in SEED_WATER_BODIES');
+
+  assert.equal(matchesWaterBodyRegion(seym!, 'kursk_oblast'), true);
+  assert.equal(matchesWaterBodyRegion(lgovLake!, 'kursk_oblast'), true);
+  assert.equal(matchesWaterBodyRegion(sugrovoDam!, 'kursk_oblast'), true);
+
+  const kurskPreset = PRESET_MAP_REGIONS.find((p) => p.id === 'region-kursk-seym-lgov');
+  assert.ok(kurskPreset, 'Kursk Seym/Lgov/Sugrovo offline preset must exist');
+  const tileEst = estimateRegionTileCount(kurskPreset!.bbox, 10, 13, 220);
+  assert.ok(tileEst > 0 && tileEst <= 220);
+
+  const kurskRegion = REGIONS_CATALOG.find((r) => r.id === 'kursk_oblast')!;
+  const focusedBbox = buildOfflineBboxForRegion(kurskRegion.center, kurskRegion.bbox);
+  assert.ok(focusedBbox.north > focusedBbox.south && focusedBbox.east > focusedBbox.west);
+});
+
+test('buildDiaryCatchAnalytics aggregates catch weight by hour of day and water temperature from weather_snapshot', async () => {
+  const { buildDiaryCatchAnalytics } = await import('./diaryAnalytics');
+  const { SEED_REPORTS } = await import('../data/seedData');
+
+  const analytics = buildDiaryCatchAnalytics(SEED_REPORTS);
+  assert.equal(analytics.totalAnalyzed, 4);
+  assert.equal(analytics.withWaterTempCount, 4);
+  assert.equal(analytics.bestHourLabel, '06:00');
+  assert.equal(analytics.bestHourAvgKg, 2.4);
+  assert.ok(analytics.byHourSeries.length >= 4);
+  assert.ok(analytics.byTempSeries.length >= 3);
+  assert.equal(analytics.scatterPoints.length, 4);
+  assert.ok(analytics.overallAvgWeightKg !== null && analytics.overallAvgWeightKg > 0);
+  assert.ok(analytics.optimalWaterTempLabel && analytics.optimalWaterTempLabel.includes('°C'));
+  assert.ok(analytics.peakWindowSummary && analytics.peakWindowSummary.includes('06:00–07:00'));
+
+  // Species filter isolates single species cleanly
+  const pikeOnly = buildDiaryCatchAnalytics(SEED_REPORTS, 'pike');
+  assert.equal(pikeOnly.totalAnalyzed, 1);
+  assert.equal(pikeOnly.scatterPoints.length, 1);
+  assert.equal(pikeOnly.bestHourLabel, '06:00');
+});
+
+test('buildCatchActivityHeatmapGeoJson aggregates recent catches, weights recency, and excludes private/no_bite reports', async () => {
+  const { buildCatchActivityHeatmapGeoJson } = await import('./catchActivityHeatmap');
+  const { SEED_REPORTS } = await import('../data/seedData');
+
+  const nowMs = Date.now();
+  const extraReports: CatchReport[] = [
+    ...SEED_REPORTS,
+    {
+      ...SEED_REPORTS[0],
+      id: 'rep-nearby-hotspot',
+      lat: SEED_REPORTS[0].lat + 0.00025,
+      lng: SEED_REPORTS[0].lng + 0.00025,
+      created_at: new Date(nowMs - 2 * 60 * 60 * 1000).toISOString(),
+      weight_kg: 3.1,
+      visibility: 'public',
+      outcome: 'catch',
+    },
+    {
+      ...SEED_REPORTS[0],
+      id: 'rep-private-hidden',
+      visibility: 'private',
+    },
+    {
+      ...SEED_REPORTS[0],
+      id: 'rep-nobite-hidden',
+      outcome: 'no_bite',
+      visibility: 'public',
+    },
+    {
+      ...SEED_REPORTS[0],
+      id: 'rep-old-catch',
+      lat: 55.1,
+      lng: 36.1,
+      created_at: new Date(nowMs - 40 * 24 * 60 * 60 * 1000).toISOString(),
+      weight_kg: 0.5,
+      author_verified: false,
+    },
+  ];
+
+  const geo = buildCatchActivityHeatmapGeoJson(extraReports, nowMs);
+  assert.equal(geo.type, 'FeatureCollection');
+  const expectedIncluded = SEED_REPORTS.filter(
+    (r) => r.visibility !== 'private' && r.outcome !== 'no_bite'
+  ).length + 2; // + rep-nearby-hotspot + rep-old-catch
+  const totalCatches = geo.features.reduce((s, f) => s + f.properties.catches_count, 0);
+  assert.equal(totalCatches, expectedIncluded, 'Should exclude private and no_bite reports');
+
+  const hotspotCell = geo.features.find((f) => f.properties.catches_count >= 2);
+  const oldCell = geo.features.find((f) => f.properties.freshest_hours_ago > 500);
+  assert.ok(hotspotCell && oldCell, 'Expected aggregated multi-catch hotspot cell and old catch cell');
+  assert.ok(
+    hotspotCell!.properties.activity_weight > oldCell!.properties.activity_weight,
+    'Recent multi-catch hotspot must have higher heatmap weight than old single catch'
+  );
+});
+
+test('offlineDb.getSpeciesListSWR performs stale-while-revalidate and falls back safely offline', async () => {
+  const { offlineDb } = await import('../utils/offlineDb');
+  const { SEED_SPECIES } = await import('../data/seedData');
+
+  let fetchCalls = 0;
+  const freshMock = SEED_SPECIES.slice(0, 3);
+  const onlineRes = await offlineDb.getSpeciesListSWR({
+    fetcher: async () => {
+      fetchCalls++;
+      return freshMock;
+    },
+    fallback: SEED_SPECIES,
+    isOnline: true,
+    forceRevalidate: true,
+  });
+  assert.equal(fetchCalls, 1);
+  assert.equal(onlineRes.source, 'network');
+  assert.equal(onlineRes.revalidated, true);
+  assert.equal(onlineRes.species.length, 3);
+
+  const offlineRes = await offlineDb.getSpeciesListSWR({
+    fetcher: async () => {
+      fetchCalls++;
+      return [];
+    },
+    fallback: SEED_SPECIES,
+    isOnline: false,
+  });
+  assert.equal(fetchCalls, 1, 'Should not call network fetcher while offline');
+  assert.equal(offlineRes.species.length, SEED_SPECIES.length);
+});
 
 
 

@@ -6,12 +6,17 @@
 		"androidScheme": "https",
 		"allowNavigation": [
 			"api.open-meteo.com",
+			"flood-api.open-meteo.com",
 			"tile.openstreetmap.org",
-			"*.tile.openstreetmap.org"
+			"*.tile.openstreetmap.org",
+			"photon.komoot.io",
+			"nominatim.openstreetmap.org",
+			"overpass-api.de",
+			"overpass.kumi.systems"
 		]
 	},
 	"android": {
 		"allowMixedContent": true,
-		"backgroundColor": "#0B3B60"
+		"backgroundColor": "#052742"
 	}
 }

@@ -22,6 +22,7 @@ import {
   filterWaterBodiesByRegionAndScale,
   getRegionById,
   isMajorWaterBody,
+  isPointInRegionBbox,
   matchesWaterBodyRegion,
 } from './src/lib/regions.ts';
 import type {
@@ -374,15 +375,20 @@ async function startServer() {
     }
     const { lat, lng, radius_km, query, region_id, major_only, select_title, select_type, select_region } = parsed.data;
     const regionDef = region_id && region_id !== 'all' ? getRegionById(region_id) : null;
-    const searchLat = regionDef && !query && !select_title ? regionDef.center.lat : lat;
-    const searchLng = regionDef && !query && !select_title ? regionDef.center.lng : lng;
+    const isDefaultOrigin = Math.abs(lat - 55.975) < 0.06 && Math.abs(lng - 36.825) < 0.06;
+    const isInsideSelectedRegion = regionDef ? isPointInRegionBbox({ lat, lng }, regionDef.bbox) : false;
+    // Never overwrite explicit user map-center coordinates outside Moscow default with region center
+    const shouldUseRegionCenter = Boolean(regionDef && !query && !select_title && isDefaultOrigin && !isInsideSelectedRegion);
+    const searchLat = shouldUseRegionCenter && regionDef ? regionDef.center.lat : lat;
+    const searchLng = shouldUseRegionCenter && regionDef ? regionDef.center.lng : lng;
 
+    const normalizedQuery = (query ?? select_title)?.replace(/платин/gi, 'плотин');
     const discoveredFromOsm = await discoverOsmWaterBodies({
       lat: searchLat,
       lng: searchLng,
-      radiusKm: radius_km ?? (regionDef ? regionDef.defaultRadiusKm : 14),
-      queryText: query ?? select_title,
-      regionId: regionDef?.id,
+      radiusKm: radius_km ?? (regionDef && shouldUseRegionCenter ? regionDef.defaultRadiusKm : 16),
+      queryText: normalizedQuery,
+      regionId: shouldUseRegionCenter ? regionDef?.id : undefined,
       majorOnly: Boolean(major_only),
     });
 
@@ -1120,14 +1126,25 @@ async function startServer() {
 
   app.get('/api/v1/geocode/search', async (req, res) => {
     const rawText = String(req.query.text ?? '').trim();
-    const text = rawText.toLowerCase();
+    const normalizedRaw = rawText.replace(/платин/gi, 'плотин');
+    const text = normalizedRaw.toLowerCase();
     if (!text) return res.json({ items: [] });
 
     const regionId = typeof req.query.region_id === 'string' && req.query.region_id.trim() ? req.query.region_id.trim() : 'all';
     const majorOnly = req.query.major_only === 'true';
     const regionDef = regionId !== 'all' ? getRegionById(regionId) : null;
 
-    const tokens = text.split(/\s+/).filter((t) => t.length >= 2);
+    const stopWords = new Set(['в', 'на', 'у', 'под', 'около', 'рядом', 'г', 'город', 'городе', 'с', 'село', 'селе', 'д', 'деревня', 'деревне', 'р', 'река', 'речка', 'оз', 'озеро', 'вдхр', 'водохранилище']);
+    const rawTokens = text
+      .replace(/[.,()«»"']/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 2);
+    const meaningfulTokens = rawTokens.filter((t) => !stopWords.has(t));
+    const matchTokens = meaningfulTokens.length > 0 ? meaningfulTokens : rawTokens;
+    const strippedText = normalizedRaw
+      .replace(/^(?:река|речка|р\.|озеро|оз\.|водохранилище|вдхр\.?|пруд|карьер|канал|старица|плотина)\s+/i, '')
+      .trim();
+
     const localMatches: Array<{
       id: string;
       title: string;
@@ -1142,10 +1159,16 @@ async function startServer() {
         if (regionDef && !matchesWaterBodyRegion(wb, regionDef.id)) return false;
         if (majorOnly && !isMajorWaterBody(wb)) return false;
         const hay = `${wb.name ?? ''} ${wb.display_label} ${wb.region}`.toLowerCase();
-        if (tokens.length > 1) {
-          return tokens.every((t) => hay.includes(t));
+        if (hay.includes(text) || (strippedText.length >= 2 && hay.includes(strippedText.toLowerCase()))) {
+          return true;
         }
-        return hay.includes(text);
+        if (matchTokens.length > 0) {
+          return matchTokens.every((t) => {
+            const stem = t.length >= 5 ? t.slice(0, t.length - 1) : t;
+            return hay.includes(t) || hay.includes(stem);
+          });
+        }
+        return false;
       })
       .slice(0, 8)
       .map((wb) => ({
@@ -1167,14 +1190,14 @@ async function startServer() {
     const cached = geocodeCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       const merged = [...localMatches, ...cached.items.filter((r) => !localMatches.some((l) => l.title === r.title))].slice(0, 10);
-      return res.json({ items: merged, source: cached.items.length > 0 ? 'hydro+photon' : 'hydro-index' });
+      return res.json({ items: merged, source: cached.items.length > 0 ? 'hydro+osm' : 'hydro-index' });
     }
 
     const remoteItems: typeof localMatches = [];
     try {
       const fetchPhoton = async (url: string) => {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 2500);
+        const timer = setTimeout(() => controller.abort(), 3000);
         try {
           const pRes = await fetch(url, {
             headers: { 'User-Agent': 'FishCastAI/1.0' },
@@ -1201,12 +1224,45 @@ async function startServer() {
         }
       };
 
-      const encoded = encodeURIComponent(rawText);
-      const [waterFeatures, generalFeatures] = await Promise.all([
+      const fetchNominatim = async (q: string) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3500);
+        try {
+          const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=jsonv2&limit=6&accept-language=ru`;
+          const nRes = await fetch(url, {
+            headers: { 'User-Agent': 'FishCastAI/1.0', 'Accept-Language': 'ru,en' },
+            signal: controller.signal,
+          });
+          if (!nRes.ok) return [];
+          const nJson = (await nRes.json()) as Array<{
+            osm_id?: number;
+            osm_type?: string;
+            name?: string;
+            display_name?: string;
+            category?: string;
+            class?: string;
+            type?: string;
+            lat?: string;
+            lon?: string;
+          }>;
+          return Array.isArray(nJson) ? nJson : [];
+        } catch {
+          return [];
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
+      const searchTerm = strippedText.length >= 2 ? strippedText : normalizedRaw;
+      const encodedPrimary = encodeURIComponent(searchTerm);
+      const encodedFull = encodeURIComponent(normalizedRaw);
+      const [waterFeatures, generalFeatures, nomPrimary, nomFull] = await Promise.all([
         fetchPhoton(
-          `https://photon.komoot.io/api/?q=${encoded}&limit=8&lat=55.975&lon=36.825&osm_tag=water&osm_tag=waterway:river&osm_tag=waterway:canal&osm_tag=natural:water`
+          `https://photon.komoot.io/api/?q=${encodedPrimary}&limit=8&osm_tag=water&osm_tag=waterway:river&osm_tag=waterway:canal&osm_tag=waterway:dam&osm_tag=waterway:weir&osm_tag=natural:water`
         ).catch(() => []),
-        fetchPhoton(`https://photon.komoot.io/api/?q=${encoded}&limit=5&lat=55.975&lon=36.825`).catch(() => []),
+        fetchPhoton(`https://photon.komoot.io/api/?q=${encodedFull}&limit=6`).catch(() => []),
+        fetchNominatim(normalizedRaw),
+        searchTerm !== normalizedRaw ? fetchNominatim(searchTerm) : Promise.resolve([]),
       ]);
 
       const nonWaterOsmKeys = new Set([
@@ -1223,6 +1279,57 @@ async function startServer() {
         'historic',
       ]);
       const seenRemote = new Set<string>();
+
+      for (const item of [...nomPrimary, ...nomFull]) {
+        const latNum = Number(item.lat);
+        const lngNum = Number(item.lon);
+        const title = (item.name || item.display_name?.split(',')[0] || '').trim();
+        if (!Number.isFinite(latNum) || !Number.isFinite(lngNum) || !title) continue;
+        const id = `nom-${item.osm_type ?? 'w'}-${item.osm_id ?? `${latNum.toFixed(4)}-${lngNum.toFixed(4)}`}`;
+        if (seenRemote.has(id)) continue;
+        seenRemote.add(id);
+
+        const cat = (item.category ?? item.class ?? '').toLowerCase();
+        const rawVal = (item.type ?? '').toLowerCase();
+        const lowerTitle = title.toLowerCase();
+        const isWater =
+          cat === 'water' ||
+          (cat === 'natural' && ['water', 'bay', 'wetland'].includes(rawVal)) ||
+          (cat === 'landuse' && ['reservoir', 'basin'].includes(rawVal)) ||
+          (cat === 'waterway' && ['river', 'canal', 'stream', 'oxbow', 'riverbank', 'dam', 'weir'].includes(rawVal)) ||
+          /водохранилищ|озеро|река|пруд|карьер|канал|плотин/.test(lowerTitle);
+
+        const waterType = isWater
+          ? inferWaterBodyTypeFromOsm(
+              {
+                waterway: cat === 'waterway' ? rawVal : undefined,
+                water: cat === 'water' ? rawVal : undefined,
+                natural: cat === 'natural' ? rawVal : undefined,
+                landuse: cat === 'landuse' ? rawVal : undefined,
+              },
+              title
+            )
+          : undefined;
+        const sub =
+          (item.display_name ?? '')
+            .split(',')
+            .slice(1, 3)
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .join(' · ') || 'OpenStreetMap';
+
+        remoteItems.push({
+          id,
+          title,
+          subtitle: isWater ? `${sub} · открыть водоём` : `${sub} · найти водоёмы рядом`,
+          lat: latNum,
+          lng: lngNum,
+          water_body_id: null,
+          is_water_body: isWater,
+          water_type: waterType,
+        });
+      }
+
       for (const feat of [...waterFeatures, ...generalFeatures]) {
         const coords = feat.geometry?.coordinates;
         const props = feat.properties;
@@ -1235,12 +1342,12 @@ async function startServer() {
         const osmVal = (props.osm_value ?? '').toLowerCase();
         const lowerName = props.name.toLowerCase();
         const isPhotonWater = isPhotonWaterFeature(props);
-        if (osmKey === 'waterway' && !isPhotonWater) continue; // skip dams, boatyards, locks, drains
+        if (osmKey === 'waterway' && !isPhotonWater) continue;
 
         const isWater =
           isPhotonWater ||
           (!nonWaterOsmKeys.has(osmKey) &&
-            /(^|\s)(река|р\.|озеро|оз\.|водохранилище|вдхр\.?|канал|пруд|карьер|старица)(\s|$)/i.test(lowerName));
+            /(^|\s)(река|р\.|озеро|оз\.|водохранилище|вдхр\.?|канал|пруд|карьер|старица|плотина)(\s|$)/i.test(lowerName));
         const waterType = isWater
           ? inferWaterBodyTypeFromOsm(
               {
@@ -1266,12 +1373,12 @@ async function startServer() {
       }
       remoteItems.sort((a, b) => Number(Boolean(b.is_water_body)) - Number(Boolean(a.is_water_body)));
     } catch {
-      // Keep local matches if Photon is offline
+      // Keep local matches if OSM geocoders are offline
     }
 
-    geocodeCache.set(text, { expiresAt: Date.now() + 15 * 60 * 1000, items: remoteItems });
+    geocodeCache.set(cacheKey, { expiresAt: Date.now() + 15 * 60 * 1000, items: remoteItems });
     const merged = [...localMatches, ...remoteItems.filter((r) => !localMatches.some((l) => l.title === r.title))].slice(0, 10);
-    return res.json({ items: merged, source: remoteItems.length > 0 ? 'hydro+photon' : 'hydro-index' });
+    return res.json({ items: merged, source: remoteItems.length > 0 ? 'hydro+osm' : 'hydro-index' });
   });
 
   // --- Fish photo recognition (FR-10) ---

@@ -17,6 +17,7 @@ import {
   X,
 } from 'lucide-react';
 import { generateBathymetryContours, haversineMeters } from '../lib/fishLogic';
+import { buildCatchActivityHeatmapGeoJson } from '../lib/catchActivityHeatmap';
 import {
   bboxToPolygonRing,
   estimateRegionTileCount,
@@ -112,6 +113,7 @@ export interface MapLayerToggles {
   baseStyle: 'scheme' | 'satellite';
   contours: boolean;
   heatmap: boolean;
+  fishActivityHeatmap: boolean;
   prospective: boolean;
   openSeaMap: boolean;
   topoOverlay: boolean;
@@ -449,6 +451,12 @@ export const FishMap: React.FC<FishMapProps> = ({
     };
   }, [reports]);
 
+  const fishActivityGeoJson = useMemo(() => buildCatchActivityHeatmapGeoJson(reports), [reports]);
+  const activeCatchReportsCount = useMemo(
+    () => reports.filter((r) => r.visibility !== 'private' && r.outcome !== 'no_bite').length,
+    [reports]
+  );
+
   const routeGeoJson = useMemo(() => {
     const features: Array<{
       type: 'Feature';
@@ -677,6 +685,42 @@ export const FishMap: React.FC<FishMapProps> = ({
         });
       }
 
+      if (!map.getSource('fish-activity-heatmap-source')) {
+        map.addSource('fish-activity-heatmap-source', {
+          type: 'geojson',
+          data: fishActivityGeoJson,
+        });
+        map.addLayer({
+          id: 'fish-activity-heatmap',
+          type: 'heatmap',
+          source: 'fish-activity-heatmap-source',
+          layout: {
+            visibility: layers.fishActivityHeatmap ? 'visible' : 'none',
+          },
+          paint: {
+            'heatmap-weight': ['interpolate', ['linear'], ['get', 'activity_weight'], 0, 0.15, 3, 1],
+            'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 6, 0.9, 13, 1.65],
+            'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 6, 18, 12, 36, 15, 52],
+            'heatmap-opacity': 0.72,
+            'heatmap-color': [
+              'interpolate',
+              ['linear'],
+              ['heatmap-density'],
+              0,
+              'rgba(16, 185, 129, 0)',
+              0.2,
+              'rgba(34, 197, 94, 0.45)',
+              0.45,
+              'rgba(250, 204, 21, 0.72)',
+              0.7,
+              'rgba(249, 115, 22, 0.85)',
+              1,
+              'rgba(225, 29, 72, 0.95)',
+            ],
+          },
+        });
+      }
+
       if (!map.getSource('catch-reports')) {
         map.addSource('catch-reports', {
           type: 'geojson',
@@ -866,11 +910,12 @@ export const FishMap: React.FC<FishMapProps> = ({
     (map.getSource('bathymetry-contours') as maplibregl.GeoJSONSource | undefined)?.setData(contoursGeoJson);
     (map.getSource('bathymetry-points') as maplibregl.GeoJSONSource | undefined)?.setData(depthPointsGeoJson);
     (map.getSource('prospective-zones') as maplibregl.GeoJSONSource | undefined)?.setData(zonesGeoJson);
+    (map.getSource('fish-activity-heatmap-source') as maplibregl.GeoJSONSource | undefined)?.setData(fishActivityGeoJson);
     (map.getSource('catch-reports') as maplibregl.GeoJSONSource | undefined)?.setData(reportsGeoJson);
     (map.getSource('split-route') as maplibregl.GeoJSONSource | undefined)?.setData(routeGeoJson);
     (map.getSource('access-pins') as maplibregl.GeoJSONSource | undefined)?.setData(accessPinGeoJson);
     (map.getSource('offline-regions') as maplibregl.GeoJSONSource | undefined)?.setData(offlineRegionsGeoJson);
-  }, [mapReady, waterGeoJson, contoursGeoJson, depthPointsGeoJson, zonesGeoJson, reportsGeoJson, routeGeoJson, accessPinGeoJson, offlineRegionsGeoJson]);
+  }, [mapReady, waterGeoJson, contoursGeoJson, depthPointsGeoJson, zonesGeoJson, fishActivityGeoJson, reportsGeoJson, routeGeoJson, accessPinGeoJson, offlineRegionsGeoJson]);
 
   // Layer visibility toggles
   useEffect(() => {
@@ -883,6 +928,7 @@ export const FishMap: React.FC<FishMapProps> = ({
     };
     setVis('contours-line', layers.contours);
     setVis('bathymetry-heatmap', layers.heatmap);
+    setVis('fish-activity-heatmap', layers.fishActivityHeatmap);
     setVis('prospective-circles', layers.prospective);
     setVis('openseamap-tiles', layers.openSeaMap && isOnline);
     setVis('opentopo-tiles', layers.topoOverlay && isOnline);
@@ -1262,6 +1308,25 @@ export const FishMap: React.FC<FishMapProps> = ({
                   checked={layers.heatmap}
                   onChange={(e) => onToggleLayers({ ...layers, heatmap: e.target.checked })}
                   className="h-4 w-4 accent-sky-700"
+                />
+              </label>
+              <label
+                data-testid="toggle-fish-activity-heatmap"
+                className="flex items-center justify-between gap-2 cursor-pointer"
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  <span
+                    className="h-2.5 w-2.5 rounded-full bg-gradient-to-tr from-amber-400 to-rose-600"
+                    aria-hidden="true"
+                  />
+                  <span>Активность рыбы</span>
+                  <span className="font-mono text-[10px] text-slate-400">({activeCatchReportsCount})</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={layers.fishActivityHeatmap}
+                  onChange={(e) => onToggleLayers({ ...layers, fishActivityHeatmap: e.target.checked })}
+                  className="h-4 w-4 accent-rose-600"
                 />
               </label>
               <label className="flex items-center justify-between gap-2 cursor-pointer">
